@@ -1,0 +1,11 @@
+# Install a CUDA build of PyTorch first (scripts/setup_venv.sh does this), e.g.
+#   pip install torch --index-url https://download.pytorch.org/whl/cu128
+# No FlashInfer / flash-attn needed: attention uses torch SDPA.
+torch>=2.4
+transformers>=4.45      # tokenizer + reference model in tests
+safetensors>=0.4
+datasets>=2.16
+huggingface_hub>=0.23
+numpy>=1.26
+matplotlib>=3.8
+pytest>=8
