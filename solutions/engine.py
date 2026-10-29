@@ -148,8 +148,10 @@ class EESDEngine:
         self.measuring = False
         self.stats = {"steps": 0, "deep_steps": 0, "probe_steps": 0, "deep_tokens": 0, "verifiers": 0, "drafted": 0,
                       "accepted": 0, "committed": 0, "plan_ms": 0.0, "plan_calls": 0, "prefill_tokens": 0,
-                      "piggyback_tokens": 0, "separate_prefills": 0, "m3_fallbacks": 0, "dropped_drafts": 0}
+                      "piggyback_tokens": 0, "separate_prefills": 0, "m3_fallbacks": 0, "dropped_drafts": 0,
+                      "kv_read_pos": 0, "kv_gathered_pos": 0}
         self.round_len = cfg.gamma   # last observed steps per round (M3 deep-size estimate)
+        self.kv_bytes_per_pos = 2 * model.cfg.n_kv_heads * model.cfg.head_dim * model.dtype.itemsize
         self.fallback_reasons: dict = {}
 
     # ------------------------------------------------------------------ helpers
@@ -219,6 +221,7 @@ class EESDEngine:
         h = None
         for s, c in split_separate(len(r.prompt), self.cfg.prefill_chunk):
             pb = build_packed(m, [Block(slot, s, c)], self.cfg.bucketing)
+            self._kv(pb, self.L)
             x = m.embed(upload(r.prompt[s:s + c], self.dev).unsqueeze(0))[0]
             h = packed_layers(m, x, pb, 0, self.L)
         y0 = m.head(h[-1:]).argmax(-1)
@@ -244,6 +247,7 @@ class EESDEngine:
         if len(dec) == 0:
             return 0, []
         pb = build_packed(m, [Block(int(i), int(self.pos[i]), 1) for i in dec], self.cfg.bucketing)
+        self._kv(pb, self.L)
         slots = [b.row for b in pb.blocks]
         iv = Interval(self.dev).start()
         x = m.embed(self.seq_buf[upload(slots, self.dev), 0])
@@ -314,6 +318,7 @@ class EESDEngine:
         if not blocks:
             return 0, []
         pb = build_packed(m, blocks, cfg.bucketing)
+        self._kv(pb, k)
         N = pb.n_tokens
         seq_idx = np.full(N, -1, dtype=np.int64)
         prompt_ids = np.zeros(N, dtype=np.int64)
@@ -420,6 +425,7 @@ class EESDEngine:
             for (p0, c, hk) in self.pending[i]:
                 blocks.append(Block(i, p0, c, ("cd", i, hk)))
         pb = build_packed(m, blocks, cfg.bucketing)
+        self._kv(pb, L - k)
         pieces, exit_rows = [], []
         vslots, vstarts, vT, vtok_packed = [], [], [], []
         cfin, cfin_idx = [], []
@@ -506,6 +512,12 @@ class EESDEngine:
         valid = jt <= acc[bt]
         matches = ((pred == Yv.unsqueeze(0)) & valid.unsqueeze(0)).sum(-1)
         return torch.cat([matches, valid.sum().view(1)])
+
+    def _kv(self, pb, n_layers: int) -> None:
+        """Account KV positions read by attention (padded per bucket) and the gathered share."""
+        if self.measuring:
+            self.stats["kv_read_pos"] += pb.kv_read_padded * n_layers
+            self.stats["kv_gathered_pos"] += pb.kv_gathered * n_layers
 
     def _switch_exit(self, new_k: int) -> None:
         dropped = int(self.d[self.state == DECODE].sum())
@@ -729,6 +741,11 @@ class EESDEngine:
             "oracle_coverage": (self.sched.oracle_answers / max(self.sched.oracle_answers + self.sched.fallback_answers, 1)
                                 if hasattr(self.sched, "oracle_answers") else None),
             "gamma_final": getattr(self.sched, "gamma", None) if self.sched is not None else None,
+            # share of the KV bytes read by attention that were first copied by an index_select gather
+            # (verify rows not contiguous); bytes per position are the same for both, so this is a byte share
+            "kv_gather_share": st["kv_gathered_pos"] / max(st["kv_read_pos"], 1),
+            "kv_read_bytes": st["kv_read_pos"] * self.kv_bytes_per_pos,
+            "kv_gathered_bytes": st["kv_gathered_pos"] * self.kv_bytes_per_pos,
             "separate_prefills": st["separate_prefills"],
             "evaluated_completions": sum(1 for c in completions if c["measured"]),
             "steps": st["steps"], "deep_steps": st["deep_steps"],

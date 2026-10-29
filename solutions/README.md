@@ -93,10 +93,16 @@ LayerSkip Llama3-8B，cnn_dm_summarization 與 gsm8k，L = 512，B ∈ {4, 16}�
 
 `@參數=值` 也能加在其他任何 config 後面（可覆寫的參數見 `run_ablation.py` 的 `OVERRIDABLE`）。
 
-已知限制（會影響量測，請在論文中寫明）：
-- 沒有 FlashInfer / flash-attn，attention 用 SDPA。
-- 驗證列不連續時要 gather KV（動機實驗 observation B1 量到 +10～31%；observation/ 另外存放）。
-- eager 模式，沒有 CUDA Graph。
+## 已知限制（會影響量測，請在論文中寫明）
+**Attention 的實作**（不改實作，只記錄）：
+- packed attention 是 SDPA 加上稠密的布林遮罩（`[b, 1, G·T, L]`）。有任意遮罩時 PyTorch 用不到 flash kernel，只能用 efficient / math kernel。
+- 同一個 bucket 的每一列都讀到該 bucket 最長的 context（L 取 bucket 內最大位置，向上取 64 的倍數），短的列也要讀滿 L，只是被遮罩掉。
+- 驗證列不連續時（例如 ASPIRE 只有部分 slot 驗證），要先用 index_select 把那些列的 KV 複製出來；連續的列直接切片。動機實驗 observation B1 量到這個複製會多花 +10～31%（observation/ 另外存放）。
+- 每次執行的結果 JSON 都有 `kv_gather_share`：attention 讀取的 KV bytes 中，經過 gather 複製的比例（依 bucket 的 b × L 計算），另有 `kv_read_bytes`、`kv_gathered_bytes`。
+- **所有方法（含 AR）都走同一條 packed 路徑**，所以相對 AR 的 speedup 是公平比較；但絕對速度低於 FlashInfer + CUDA Graph 這類實作，不能直接和那些系統的 tok/s 比。
+
+**其他**：
+- eager 模式，沒有 CUDA Graph；每一步的 Python 處理會反映在牆鐘吞吐量和 `host_overhead_share`。
 - cyclic 量測一開始填滿 batch 時，一律用 separate prefill（此時還沒有可以搭載的 step）。
 
 ## 輸出

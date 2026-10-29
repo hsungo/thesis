@@ -313,7 +313,7 @@ def summarize(out: Path) -> None:
                                               "tokens_per_deep_step", "verifiers_per_deep_step", "acceptance_rate",
                                               "k_final", "plan_ms_per_step", "ttft_ms_mean", "ttft_ms_p99", "tpot_ms_mean",
                                               "tpot_ms_p99", "prefill_time_share", "piggyback_share_of_prefill_tokens",
-                                              "m3_fallbacks", "probe_steps", "oracle_coverage", "gamma_final",
+                                              "m3_fallbacks", "probe_steps", "oracle_coverage", "gamma_final", "kv_gather_share",
                                               "evaluated_completions", "stop_reason")},
                      "k_switches": max(len(m.get("k_timeline") or []) - 1, 0)})
         if "poisson" in d:
@@ -350,7 +350,7 @@ def summarize(out: Path) -> None:
         groups.setdefault((r["model"], r["dataset"], r["length"], r["B"], r["config"]), []).append(r)
     agg = []
     metrics = ["throughput_tok_s", "e2e_throughput_tok_s", "wall_throughput_tok_s", "speedup_vs_ar", "e2e_speedup_vs_ar",
-               "wall_speedup_vs_ar", "host_overhead_share", "deep_steps_per_token",
+               "wall_speedup_vs_ar", "host_overhead_share", "kv_gather_share", "deep_steps_per_token",
                "tokens_per_deep_step", "acceptance_rate", "plan_ms_per_step", "ttft_ms_mean", "tpot_ms_p99",
                "prefill_time_share", "piggyback_share_of_prefill_tokens", "k_switches", "identical_to_ar"]
     for g, rr in sorted(groups.items()):

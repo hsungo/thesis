@@ -71,6 +71,8 @@ class PackedBatch:
     buckets: list = field(default_factory=list)
     n_tokens: int = 0
     kv_read: int = 0        # sum over blocks of attended positions (per layer)
+    kv_read_padded: int = 0  # positions SDPA actually reads per layer: every row of a bucket up to the bucket's L
+    kv_gathered: int = 0     # of those, positions copied by an index_select gather (non-contiguous rows)
 
     def block_slice(self, i: int) -> slice:
         return slice(int(self.offsets[i]), int(self.offsets[i + 1]))
@@ -130,6 +132,9 @@ def build_packed(model, blocks: list, bucketing: str = "exact") -> PackedBatch:
         pb.buckets.append(Bucket(start, end, nb, Tmax, L, None if contiguous else upload(rws, dev),
                                  rws[0], mask, upload(pad_idx, dev) if pad_idx is not None else None))
         pb.kv_read += sum(b.pos0 + b.T for b in g)
+        pb.kv_read_padded += nb * L
+        if not contiguous:
+            pb.kv_gathered += nb * L
         i0 += nb
     return pb
 

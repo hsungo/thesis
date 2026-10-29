@@ -527,3 +527,20 @@ def test_sensitivity_preset_changes_one_parameter_at_a_time():
         assert seen[k] | {SENS_DEFAULTS[k]} == set(vals) | {SENS_DEFAULTS[k]}
     with pytest.raises(ValueError):
         engine_config("all@temperature=1", args)
+
+
+# ------------------------------------------------------------------------------ KV gather accounting (item 6)
+
+def test_kv_gather_share_is_reported(tiny_model, ar_ref):
+    from solutions.packed import Block, build_packed
+
+    tiny_model.allocate_cache(4, 128)
+    pb = build_packed(tiny_model, [Block(0, 10, 1), Block(2, 70, 1), Block(1, 5, 3)], "exact")
+    # bucket T=1 holds rows 0 and 2 (not contiguous -> gathered), padded to L = 128; bucket T=3 holds row 1
+    assert pb.kv_read_padded == 2 * 128 + 64 and pb.kv_gathered == 2 * 128
+    prompts, _ = ar_ref
+    sync = _engine(tiny_model, _cfg(sched="fixed")).run(prompts, "static")["metrics"]
+    indep = _engine(tiny_model, _cfg(sched="aspire")).run(prompts, "static")["metrics"]
+    for m in (sync, indep):
+        assert 0.0 <= m["kv_gather_share"] <= 1.0 and m["kv_read_bytes"] > 0
+    assert indep["kv_gather_share"] >= sync["kv_gather_share"]   # per-request verification gathers more often
