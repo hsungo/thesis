@@ -61,6 +61,7 @@ class EngineConfig:
     k_cands: tuple = (2, 3, 4, 5, 6, 7, 8)
     switch_margin: float = 0.05
     max_wait: int = 3
+    knee_safety: float = 0.9
     prefill_chunk: int = 512
     bucketing: str = "exact"        # exact | pad (attention bucketing, packed GEMMs either way)
     m3_chunk_cap: Optional[int] = None   # tests: force small chunks
@@ -138,7 +139,7 @@ class EESDEngine:
                                     alpha0=cfg.alpha0) if cfg.mode == "spec" else None
         self.exitc = ExitController(cost_model, self.k, [c for c in cfg.k_cands if 1 <= c < self.L], cfg.probe_every,
                                     cfg.switch_margin, cfg.omega, Dm, cfg.m2_force) if cfg.exit == "m2" else None
-        self.m3 = M3Planner(cost_model, cfg.max_wait, cfg.m3_chunk_cap, cfg.prefill_chunk) if cfg.prefill == "m3" else None
+        self.m3 = M3Planner(cost_model, cfg.max_wait, cfg.m3_chunk_cap, cfg.prefill_chunk, cfg.knee_safety) if cfg.prefill == "m3" else None
         self.measuring = False
         self.stats = {"steps": 0, "deep_steps": 0, "probe_steps": 0, "deep_tokens": 0, "verifiers": 0, "drafted": 0,
                       "accepted": 0, "committed": 0, "plan_ms": 0.0, "plan_calls": 0, "prefill_tokens": 0,

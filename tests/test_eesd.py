@@ -280,7 +280,7 @@ def test_ablation_config_names():
     from solutions.run_ablation import BASE, MECH, engine_config
 
     args = argparse.Namespace(k=3, d_max=16, sla_steps=32, probe_every=20, k_cands=[2, 3, 4], switch_margin=0.05,
-                              max_wait=3, prefill_chunk=512, bucketing="exact", base_gamma=4)
+                              max_wait=3, knee_safety=0.9, prefill_chunk=512, bucketing="exact", base_gamma=4)
     seen = {}
     for name in BASE + MECH + ["fixed-g3-k6"]:
         cfg, cost = engine_config(name, args)
@@ -313,3 +313,46 @@ def test_ablation_summary_pairs_with_ar(tmp_path):
     assert abs(float(agg["m1"]["speedup_vs_ar_mean"]) - np.mean([180 / 100, 182 / 101])) < 1e-9
     assert float(agg["m1"]["speedup_vs_ar_std"]) > 0
     assert (tmp_path / "SUMMARY.md").exists()
+
+
+# ------------------------------------------------------------------------------ measured knee / F_eff (item 1)
+
+def test_roofline_uses_measured_knee_and_feff():
+    from common.model import ModelConfig
+    from solutions.cost_model import synthetic_cost_model
+
+    cfg = ModelConfig(vocab_size=128256, dim=4096, n_layers=32, n_heads=32, n_kv_heads=8, head_dim=128,
+                      intermediate_size=14336, norm_eps=1e-5, rope_theta=5e5, max_position_embeddings=8192)
+    new, old = synthetic_cost_model(cfg, "roofline"), synthetic_cost_model(cfg, "roofline-peak")
+    assert new.knee() == 100.0                                         # knee_measured
+    assert np.isclose(old.knee(), old.gpu.flops / old.gpu.bw)            # analytic F*W/(2P*BW) with W = 2P
+    big = 4096                                                           # compute-bound: F_eff < peak -> slower
+    assert new.layer_gemm_ms(big) > old.layer_gemm_ms(big)
+    assert np.isclose(new.layer_gemm_ms(big), 2 * new.dims.layer_params * big / new.gpu.flops_eff)
+
+
+@pytest.mark.parametrize("safety", [0.9, 0.8])
+def test_m3_chunks_respect_measured_knee(tiny_model, ar_ref, safety):
+    """Every step that carries a prefill chunk keeps (chunk + decode tokens) <= knee_measured * safety
+    in its shallow segment, and the planner's budget never exceeds that bound."""
+    from solutions.cost_model import synthetic_cost_model
+    from solutions.engine import EESDEngine
+    from solutions.prefill import M3Planner
+
+    prompts, ref = ar_ref
+    cm = synthetic_cost_model(tiny_model.cfg)
+    cm.gpu.knee_measured = 12.0
+    bound = 12.0 * safety
+    cfg = _cfg(sched="m1", prefill="m3", m3_chunk_cap=None, knee_safety=safety)
+    eng = EESDEngine(tiny_model, 3, 24, MAX_NEW, (), cfg, cm)
+    res = eng.run(prompts, "static", keep_outputs=True)
+    assert _outputs(res) == ref
+    carried = [r for r in eng.records if r.n_chunk > 0 and r.kind != "prefill"]
+    assert carried, "some chunk must actually be piggybacked"
+    dec_only = [r for r in carried if r.n_sh - r.n_chunk > 0]          # flush steps (no decode slot) are exempt
+    assert all(r.n_sh <= bound for r in dec_only), [(r.n_sh, r.n_chunk) for r in dec_only]
+    p = M3Planner(cm, knee_safety=safety)
+    for n_sh in range(0, 14):
+        for n_dp in range(0, 14):
+            c = p.budget(n_sh, n_dp, 0)
+            assert c == 0 or (c + n_sh <= bound and c + n_dp <= bound)

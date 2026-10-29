@@ -5,14 +5,17 @@
 
 What is measured
     BW      large GEMV (n=1) through a 28672 x 8192 bf16 weight (weight-streaming bandwidth)
-    F       8192^3 bf16 GEMM
+    F       8192^3 bf16 GEMM (peak; kept for the "roofline_peak" comparison)
+    F_eff   the model's own layer GEMMs (QKV, O, W13, W2) for n = 1..512: highest flop rate reached
+    knee    hinge fit of one real packed decoder layer timed for n = 1..512 tokens (knee_measured)
     t_op    a loop of tiny eager kernels (launch-bound time per op)
     n_op    kernels issued by one packed decoder layer (1 and 2 attention buckets), by the head and by
             the packed-metadata build, counted with the CUDA profiler on the loaded model
     linear  ASPIRE-style 3-parameter fit (a + b n + c KV) on measured per-layer times of the real
             packed layer over a (tokens, context) grid, and a 2-parameter head fit
 Validation (``--validate``) times real shallow steps, deep steps and prefill chunks of the engine's
-packed code path on a grid and reports MAPE / max APE of the roofline and linear predictions.
+packed code path on a grid and reports MAPE / max APE of three predictions - roofline (F_eff + measured
+knee), roofline_peak (previous version) and linear - overall, per step kind, and for n = 64..256 tokens.
 """
 
 from __future__ import annotations
@@ -117,6 +120,58 @@ def layer_grid(m, Bs=(1, 4, 16, 32, 64), Ts=(1, 4, 8, 17), ctxs=(256, 1024, 2048
     return rows, heads
 
 
+N_GRID = (1, 2, 4, 8, 16, 24, 32, 48, 64, 80, 96, 112, 128, 160, 192, 224, 256, 320, 384, 448, 512)
+
+
+def measure_flops_eff(m, ns=N_GRID) -> dict:
+    """F_eff: flop/ms reached by the model's own layer GEMMs (QKV, O, W13, W2 of layer 0) for n = 1..512
+    tokens.  At small n the GEMMs are weight-bound, so the rate rises with n; F_eff is the highest rate in
+    this decode-sized range (what a compute-bound step can actually get, instead of the 8192^3 peak)."""
+    lw = m.layers[0]
+    shapes = [(lw.wqkv, m.cfg.dim), (lw.wo, m.q_size), (lw.w13, m.cfg.dim), (lw.w2, m.cfg.intermediate_size)]
+    params = sum(w.numel() for w, _ in shapes)
+    rows = []
+    with torch.inference_mode():
+        for n in ns:
+            xs = [torch.randn(n, d_in, device=m.device, dtype=m.dtype) for _, d_in in shapes]
+            ms = _t(lambda: [F.linear(x, w) for (w, _), x in zip(shapes, xs)], reps=20, warm=5)
+            rows.append({"n": n, "ms": ms, "flop_per_ms": 2.0 * params * n / ms})
+    best = max(rows, key=lambda r: r["flop_per_ms"])
+    return {"flops_eff": best["flop_per_ms"], "flops_eff_at_n": best["n"], "gemm_grid": rows}
+
+
+def hinge_knee(ns, ms, grid=None) -> tuple[float, list]:
+    """Least squares (relative error) of t = a + b * max(n - knee, 0) over a knee grid."""
+    n = np.asarray(ns, dtype=float)
+    y = np.asarray(ms, dtype=float)
+    w = 1.0 / y
+    best = None
+    for kn in (grid if grid is not None else np.arange(4.0, n.max(), 2.0)):
+        X = np.c_[np.ones_like(n), np.maximum(n - kn, 0.0)]
+        beta, *_ = np.linalg.lstsq(X * w[:, None], y * w, rcond=None)
+        if beta[1] < 0:
+            continue
+        sse = float(np.sum(((X @ beta - y) * w) ** 2))
+        if best is None or sse < best[0]:
+            best = (sse, float(kn), beta.tolist())
+    return best[1], best[2]
+
+
+def measure_knee(m, ns=N_GRID, ctx: int = 128) -> dict:
+    """knee_measured: one real packed decoder layer (n requests x 1 token, short context) for n = 1..512,
+    hinge-fitted."""
+    rows = []
+    with torch.inference_mode():
+        m.allocate_cache(max(ns), ctx + 64)
+        for n in ns:
+            pb = build_packed(m, [Block(b, ctx, 1) for b in range(n)])
+            x = torch.randn(n, m.cfg.dim, device=m.device, dtype=m.dtype)
+            rows.append({"n": n, "ms": _t(lambda: packed_layer(m, 1, x, pb), reps=20, warm=5)})
+        m.free_cache()
+    knee, beta = hinge_knee([r["n"] for r in rows], [r["ms"] for r in rows])
+    return {"knee_measured": knee, "knee_fit": {"a": beta[0], "b": beta[1]}, "layer_grid": rows}
+
+
 def fit_linear(rows, heads) -> dict:
     X = np.array([[1.0, r["n"], r["kv"]] for r in rows])
     y = np.array([r["ms"] for r in rows])
@@ -142,7 +197,8 @@ def validate(m, cms: dict, k: int, out_csv: Path) -> dict:
                 pb = build_packed(m, [Block(b, C, 1) for b in range(B)])
                 x = torch.randn(B, m.cfg.dim, device=m.device, dtype=m.dtype)
                 ms = _t(lambda: m.head(packed_layers(m, x, pb, 0, k)).argmax(-1), reps=10, warm=3)
-                rows.append({"kind": "shallow", "B": B, "ctx": C, "T": 1, **{n: float(c.t_sh(B, k, pb.kv_read)) for n, c in cms.items()}, "ms": ms})
+                rows.append({"kind": "shallow", "B": B, "ctx": C, "T": 1, "n": B,
+                             **{n: float(c.t_sh(B, k, pb.kv_read)) for n, c in cms.items()}, "ms": ms})
                 for T in (2, 4, 6, 9, 17):                     # deep step: latest draft [0,k), T tokens [k,L), head
                     pbs = build_packed(m, [Block(b, C + T - 1, 1) for b in range(B)])
                     pbd = build_packed(m, [Block(b, C, T) for b in range(B)])
@@ -152,7 +208,7 @@ def validate(m, cms: dict, k: int, out_csv: Path) -> dict:
                         packed_layers(m, x, pbs, 0, k)
                         m.head(packed_layers(m, xd, pbd, k, L)).argmax(-1)
                     ms = _t(deep, reps=10, warm=3)
-                    rows.append({"kind": "deep", "B": B, "ctx": C, "T": T,
+                    rows.append({"kind": "deep", "B": B, "ctx": C, "T": T, "n": B * T,
                                  **{n: float(c.t_deep(B * T, k, pbd.kv_read, B)) for n, c in cms.items()}, "ms": ms})
                 for n_tok in (64, 256, 1024):                  # separate prefill chunk on row 0
                     if B != 1:
@@ -160,7 +216,7 @@ def validate(m, cms: dict, k: int, out_csv: Path) -> dict:
                     pbp = build_packed(m, [Block(0, C, n_tok)])
                     xp = torch.randn(n_tok, m.cfg.dim, device=m.device, dtype=m.dtype)
                     ms = _t(lambda: m.head(packed_layers(m, xp, pbp, 0, L)[-1:]).argmax(-1), reps=5, warm=2)
-                    rows.append({"kind": "prefill", "B": 1, "ctx": C, "T": n_tok,
+                    rows.append({"kind": "prefill", "B": 1, "ctx": C, "T": n_tok, "n": n_tok,
                                  **{n: float(c.t_prefill(n_tok, pbp.kv_read)) for n, c in cms.items()}, "ms": ms})
                 m.free_cache()
     with open(out_csv, "w", newline="") as f:
@@ -169,8 +225,11 @@ def validate(m, cms: dict, k: int, out_csv: Path) -> dict:
         w.writerows(rows)
     summ = {}
     for name in cms:
-        for kind in ("shallow", "deep", "prefill", "all"):
-            rr = [r for r in rows if kind == "all" or r["kind"] == kind]
+        for kind in ("shallow", "deep", "prefill", "all", "n64_256"):
+            if kind == "n64_256":   # the range around the knee, where peak-F vs F_eff and the knee matter most
+                rr = [r for r in rows if 64 <= r["n"] <= 256]
+            else:
+                rr = [r for r in rows if kind == "all" or r["kind"] == kind]
             if rr:
                 ape = np.array([abs(r[name] - r["ms"]) / r["ms"] for r in rr])
                 summ[f"{name}_{kind}"] = {"n": len(rr), "mape": float(ape.mean()), "max_ape": float(ape.max())}
@@ -194,8 +253,16 @@ def main() -> None:
     out = Path(args.out) if args.out else RESULTS / "calibration" / f"{name}.json"
     mic = micro(model.device)
     ops = trace_ops(model)
-    gpu = GPUParams(**mic, **ops, meta={"host": socket.gethostname(), "env": env_info(model.device)})
+    fe = measure_flops_eff(model)
+    kn = measure_knee(model)
+    gpu = GPUParams(**mic, **ops, flops_eff=fe["flops_eff"], knee_measured=kn["knee_measured"],
+                    meta={"host": socket.gethostname(), "env": env_info(model.device),
+                          "flops_eff_at_n": fe["flops_eff_at_n"], "knee_fit": kn["knee_fit"],
+                          "knee_analytic_peak": mic["flops"] * 2 / (2 * mic["bw"]),
+                          "gemm_grid": fe["gemm_grid"], "knee_layer_grid": kn["layer_grid"]})
     res = {"model": name, "gpu": gpu, "model_dims": ModelDims.from_config(model.cfg).__dict__}
+    print(f"[calibrate] F peak {mic['flops'] / 1e9:.1f} TFLOP/s, F_eff {fe['flops_eff'] / 1e9:.1f} TFLOP/s "
+          f"(n={fe['flops_eff_at_n']}); knee measured {kn['knee_measured']:.0f} tokens", flush=True)
     if not args.skip_linear:
         rows, heads = layer_grid(model)
         res["linear"] = {**fit_linear(rows, heads), "n_layers": model.n_layers, "model_name": name}
@@ -203,13 +270,14 @@ def main() -> None:
     print(json.dumps({k: v for k, v in res.items() if k != "linear_grid"}, indent=2, default=str))
     if args.validate:
         dims = ModelDims.from_config(model.cfg)
-        cms = {"roofline": RooflineCostModel(gpu, dims)}
+        cms = {"roofline": RooflineCostModel(gpu, dims, variant="measured"),        # F_eff + measured knee
+               "roofline_peak": RooflineCostModel(gpu, dims, variant="peak")}     # previous version (8192^3 peak)
         if "linear" in res:
             lin = res["linear"]
             cms["linear"] = LinearCostModel(lin["a"], lin["b"], lin["c"], lin["head_a"], lin["head_b"], dims)
         res["validation"] = validate(model, cms, args.k, out.with_name(out.stem + "_validation.csv"))
         for kname, v in res["validation"].items():
-            print(f"[calibrate] {kname:20s} n={v['n']:3d}  MAPE {100 * v['mape']:5.1f}%  max {100 * v['max_ape']:5.1f}%")
+            print(f"[calibrate] {kname:28s} n={v['n']:3d}  MAPE {100 * v['mape']:5.1f}%  max {100 * v['max_ape']:5.1f}%")
     save_json(out, res)
     print(f"[calibrate] wrote {out}")
 

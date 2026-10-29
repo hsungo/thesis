@@ -12,11 +12,11 @@
 |---|---|
 | `engine.py` | 合併執行引擎 `EESDEngine`（shallow / deep step、KV 長度指標回滾、CPU 端 NumPy 狀態），以及三種 driver：cyclic replay（ASPIRE 協定）、static（每個 prompt 一次）、Poisson 到達 |
 | `packed.py` | 不等長批次：token 接成一條，用 `qo_indptr = cumsum(d_i+1)` 分段。GEMM / MLP / head 不做 padding；attention 依 query 長度分桶（`exact`：同長度一桶，完全不 pad；`pad`：每段一桶） |
-| `cost_model.py` | 可攜式 roofline 成本模型：`t_layer(n,C) = max(W/BW, 2·P·n/F) + KV(C)/BW + n_op·t_op`。提供 `t_sh / t_deep / t_prefill / t_segment / knee`，GEMM 項啟動時先查表；另有 ASPIRE 式 3 參數線性模型（消融用） |
+| `cost_model.py` | 可攜式 roofline 成本模型：`t_layer(n,C) = max(W/BW, 2·P·n/F_eff) + KV(C)/BW + n_op·t_op`。提供 `t_sh / t_deep / t_prefill / t_segment / knee`，GEMM 項啟動時先查表；`knee()` 回傳實測膝點。另有 `roofline-peak`（舊版：8192³ 峰值 F 與解析膝點，只用於比較 MAPE）和 ASPIRE 式 3 參數線性模型（消融用） |
 | `schedulers.py` | `--sched fixed / aspire / m1` |
 | `exit_select.py` | `--exit m2`（整批共用、動態選擇退出層） |
 | `prefill.py` | `--prefill separate / m3`（依深度拆開的 prefill 搭載） |
-| `calibrate.py` | 每台 GPU、每個模型量一次 BW、F、t_op、n_op 和線性擬合，存成 JSON；`--validate` 量實際 step 時間並算出 MAPE |
+| `calibrate.py` | 每台 GPU、每個模型量一次 BW、峰值 F、**F_eff**（模型自己的 QKV/O/W13/W2 形狀在 n = 1..512 的最高有效算力）、**knee_measured**（一層 decoder 在 n = 1..512 的實測時間做 hinge 擬合）、t_op、n_op 和線性擬合，存成 JSON；`--validate` 量實際 step 時間，報告 roofline（新）、roofline_peak（舊）、linear 三者的 MAPE，並單獨報告 n = 64..256 這一段 |
 | `check_lossless.py` | 實機無損檢查：每種開關組合都和 AR 比對（fp32 要完全一致；bf16 回報一致率與 AR 自身的下限） |
 | `run_ablation.py` | 量測與消融（presets、CSV、平均 ± 標準差摘要表，可續跑） |
 
@@ -55,7 +55,7 @@ CPU 測試在 `tests/test_eesd.py`（`python -m pytest`，不需要 GPU），涵
   - 換 k 時捨棄舊 k 產生的未驗證 draft（draft 只是猜測，所以仍然無損）。
   - k 隨時間的變化記在 `k_timeline`。
 - **M3（`--prefill m3`）**：
-  - 塊大小 `c = min(剩餘, knee − 這一步淺段的 token 數, knee − 預估下一個深段的 token 數)`。
+  - 塊大小 `c = min(剩餘, knee·s − 這一步淺段的 token 數, knee·s − 預估下一個深段的 token 數)`。knee 是校準實測的膝點（不再用峰值 F 推算；舊算法約 169 tokens，實測約 104），s = `--knee-safety`（預設 0.9）。
   - 每塊在某一步的淺段跑 `[0,k)`，存下第 k 層的 hidden state；在下一個 deep step 的深段跑 `[k,L)`。每層的 KV 都會寫入，後面的塊可以 attend 到前面的塊。
   - 最後一塊做完時產生第一個 token，該 request 從 d = 0 開始 draft。
   - 退回一般 prefill 的條件（在 request 進入 slot 時判斷）：沒有低於膝點的空間、需要超過 `--max-wait` 個 deep step，或成本模型估計 Δt(c) ≥ 另外跑的時間。原因記在 `m3_fallback_reasons`。

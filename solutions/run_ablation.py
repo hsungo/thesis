@@ -76,6 +76,7 @@ def engine_config(name: str, args):
     from solutions.engine import EngineConfig
     base = dict(k=args.k, d_max=args.d_max, sla_steps=args.sla_steps, probe_every=args.probe_every,
                 k_cands=tuple(args.k_cands), switch_margin=args.switch_margin, max_wait=args.max_wait,
+                knee_safety=args.knee_safety,
                 prefill_chunk=args.prefill_chunk, bucketing=args.bucketing, gamma=args.base_gamma)
     cost = "roofline"
     if name == "ar":
@@ -373,6 +374,7 @@ def main() -> None:
     ap.add_argument("--k-cands", nargs="+", type=int, default=[2, 3, 4, 5, 6, 7, 8])
     ap.add_argument("--switch-margin", type=float, default=0.05)
     ap.add_argument("--max-wait", type=int, default=3)
+    ap.add_argument("--knee-safety", type=float, default=0.9, help="M3 fills a step up to measured knee * safety")
     ap.add_argument("--prefill-chunk", type=int, default=512)
     ap.add_argument("--bucketing", choices=["exact", "pad"], default="exact")
     ap.add_argument("--min-eval-per-slot", type=float, default=2.0)

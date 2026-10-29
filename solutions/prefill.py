@@ -9,8 +9,9 @@ m3         mechanism 3, depth-split piggybacking: a chunk of the pending prompt 
            The final chunk's deep pass yields the first generated token; the request then starts
            drafting with d = 0.
 
-           chunk size  c = min(remaining, knee - tokens already in the shallow segment,
-                               knee - tokens expected in the next deep segment)
+           chunk size  c = min(remaining, knee*s - tokens already in the shallow segment,
+                               knee*s - tokens expected in the next deep segment)
+           knee = measured knee of the cost model (calibrate), s = --knee-safety (default 0.9)
            piggyback only if  dt(c) < t_prefill(c)   (marginal cost in both segments vs a separate pass)
            fall back to `separate` when c <= 0 (no room below the knee), when the prompt would need more
            than ``--max-wait`` deep steps, or when dt(c) >= t_prefill(c).  The decision is taken when the
@@ -25,12 +26,17 @@ import math
 
 
 class M3Planner:
-    def __init__(self, cost_model, max_wait: int = 3, chunk_cap: int | None = None, no_knee_chunk: int = 512):
+    def __init__(self, cost_model, max_wait: int = 3, chunk_cap: int | None = None, no_knee_chunk: int = 512,
+                 knee_safety: float = 0.9):
         self.cm, self.max_wait, self.chunk_cap = cost_model, max_wait, chunk_cap
         self.no_knee_chunk = no_knee_chunk      # a model without a knee (linear) never limits the chunk: cap it
+        self.knee_safety = knee_safety          # fill the step only up to knee * safety (--knee-safety)
+
+    def knee(self) -> float:
+        return self.cm.knee() * self.knee_safety
 
     def budget(self, n_sh: int, n_deep_est: int, pending_deep: int) -> int:
-        knee = self.cm.knee()
+        knee = self.knee()
         if not math.isfinite(knee):
             knee = self.no_knee_chunk + max(n_sh, n_deep_est + pending_deep)
         c = int(min(knee - n_sh, knee - n_deep_est - pending_deep))

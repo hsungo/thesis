@@ -7,7 +7,9 @@
     n      tokens through the layer in this step
     KV(C)  bytes of K and V read by attention for C cached positions (summed over requests)
     BW     effective weight-streaming bandwidth (large GEMV)          \\
-    F      dense bf16 GEMM throughput (large GEMM)                     |  calibrate(), once per GPU
+    F      effective bf16 GEMM throughput of the model's own layer      |  calibrate(), once per GPU
+           shapes at decode sizes (F_eff; the 8192^3 peak is kept as     |
+           the "roofline-peak" variant)                                  |
     t_op   time of one eager op (empty-kernel loop, launch-bound)      |
     n_op   ops issued per layer by this implementation (traced)       /
 
@@ -19,7 +21,8 @@ is added.  Provided queries (all in ms):
     t_deep(n, k, C, n_req)        deep step: n_req latest drafts through [0,k), n tokens through [k,L), head on n
     t_prefill(n, C)               separate prefill chunk: n tokens through all L layers + head on 1 token
     t_segment(n_layers, n, C)     generic segment (used by the M3 marginal-cost test)
-    knee(k)                       tokens per layer where the GEMMs turn compute-bound (F*W / (2*P*BW))
+    knee(k)                       tokens per layer where a layer turns compute-bound: the hinge knee measured by
+                                  calibrate (knee_measured); F*W / (2*P*BW) only if no measurement exists
 
 `LinearCostModel` (ablation, ASPIRE-style 3 parameters) prices a layer as a + b*n + c*KV positions,
 least-squares fitted on measured layer times; it has the same interface.
@@ -33,6 +36,7 @@ from __future__ import annotations
 import json
 from dataclasses import asdict, dataclass, field
 from pathlib import Path
+from typing import Optional
 
 import numpy as np
 
@@ -79,6 +83,8 @@ class GPUParams:
     n_op_head: float           # ops of norm + lm_head + argmax
     n_op_segment: float        # ops to build a packed segment's metadata (per segment)
     meta: dict = field(default_factory=dict)
+    flops_eff: Optional[float] = None       # flop / ms the model's own layer GEMMs reach for n <= 512 (calibrate)
+    knee_measured: Optional[float] = None   # tokens: hinge fit of one measured decoder layer over n = 1..512
 
 
 # ------------------------------------------------------------------------------ models
@@ -116,20 +122,26 @@ class _Base:
 
 
 class RooflineCostModel(_Base):
+    """variant="measured" (default): compute term uses F_eff (the model's own GEMM shapes at decode sizes)
+    and knee() returns the measured knee; variant="peak": the original form (8192^3 GEMM peak F, analytic
+    knee F*W/(2*P*BW)), kept for the MAPE comparison in calibrate --validate.  Calibration files without
+    the measured fields fall back to the peak values."""
     kind = "roofline"
 
-    def __init__(self, gpu: GPUParams, dims: ModelDims, n_max: int = 16384):
-        self.gpu, self.dims = gpu, dims
+    def __init__(self, gpu: GPUParams, dims: ModelDims, n_max: int = 16384, variant: str = "measured"):
+        self.gpu, self.dims, self.variant = gpu, dims, variant
+        use_eff = variant == "measured" and gpu.flops_eff
+        self.F = float(gpu.flops_eff) if use_eff else float(gpu.flops)
         n = np.arange(n_max + 1, dtype=np.float64)
-        self._layer_tab = np.maximum(dims.layer_bytes / gpu.bw, 2.0 * dims.layer_params * n / gpu.flops)
-        self._head_tab = np.maximum(dims.head_bytes / gpu.bw, 2.0 * dims.head_params * n / gpu.flops)
+        self._layer_tab = np.maximum(dims.layer_bytes / gpu.bw, 2.0 * dims.layer_params * n / self.F)
+        self._head_tab = np.maximum(dims.head_bytes / gpu.bw, 2.0 * dims.head_params * n / self.F)
         self._n_max = n_max
 
     def _lookup(self, tab, n, w_bytes, params):
         """Table lookup for n <= n_max (start-up precomputation), exact formula beyond."""
         n = np.asarray(n)
         idx = np.clip(n, 0, self._n_max).astype(np.int64)
-        exact = np.maximum(w_bytes / self.gpu.bw, 2.0 * params * n / self.gpu.flops)
+        exact = np.maximum(w_bytes / self.gpu.bw, 2.0 * params * n / self.F)
         return np.where(n <= self._n_max, tab[idx], exact)
 
     def layer_gemm_ms(self, n):
@@ -150,8 +162,11 @@ class RooflineCostModel(_Base):
         return self.gpu.n_op_segment * self.gpu.t_op
 
     def knee(self, k: int | None = None) -> float:
-        """Tokens per layer where 2*P*n/F = W/BW (independent of k: every layer has the same shape)."""
-        return self.gpu.flops * self.dims.layer_bytes / (2.0 * self.dims.layer_params * self.gpu.bw)
+        """Tokens per layer where a layer turns compute-bound (same for every k: all layers have one shape).
+        measured variant: the hinge knee fitted on measured layer times; otherwise F*W / (2*P*BW)."""
+        if self.variant == "measured" and self.gpu.knee_measured:
+            return float(self.gpu.knee_measured)
+        return self.F * self.dims.layer_bytes / (2.0 * self.dims.layer_params * self.gpu.bw)
 
 
 class LinearCostModel(_Base):
@@ -188,8 +203,8 @@ def load_cost_model(path: str | Path, cfg, kind: str = "roofline"):
     """path: calibration JSON written by solutions/calibrate.py; cfg: ModelConfig of the served model."""
     d = json.loads(Path(path).read_text())
     dims = ModelDims.from_config(cfg)
-    if kind == "roofline":
-        return RooflineCostModel(GPUParams(**d["gpu"]), dims)
+    if kind in ("roofline", "roofline-peak"):
+        return RooflineCostModel(GPUParams(**d["gpu"]), dims, variant="measured" if kind == "roofline" else "peak")
     if kind == "linear":
         lin = d.get("linear")
         if lin is None:
@@ -204,9 +219,9 @@ def synthetic_cost_model(cfg, kind: str = "roofline"):
     """Deterministic made-up GPU (RTX-4090-like) for CPU tests and dry runs - never used for results."""
     dims = ModelDims.from_config(cfg)
     gpu = GPUParams(bw=1.0e9, flops=1.6e11, t_op=0.003, n_op_layer=52, n_op_bucket=12, n_op_head=11, n_op_segment=20,
-                    meta={"source": "synthetic (tests only)"})
-    if kind == "roofline":
-        return RooflineCostModel(gpu, dims)
+                    meta={"source": "synthetic (tests only)"}, flops_eff=1.0e11, knee_measured=100.0)
+    if kind in ("roofline", "roofline-peak"):
+        return RooflineCostModel(gpu, dims, variant="measured" if kind == "roofline" else "peak")
     return LinearCostModel(0.6, 0.002, 4e-6, 1.2, 0.007, dims)
 
 
