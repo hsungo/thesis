@@ -49,6 +49,8 @@ CPU 測試在 `tests/test_eesd.py`（`python -m pytest`，不需要 GPU），涵
 - **M1（`--sched m1`）**：每一步之後比較
   `R(s) = Σ E_i(d_i) / (s·t_sh + t_deep)` 和 `R(s+1)`，其中 `E_i(d) = (1−α_i^{d+1})/(1−α_i)`。
   - R(s+1) > R(s) 就繼續 draft，否則跑 deep step。
+  - 成本的算法：淺層（每個 shallow step，以及 deep step 本身的淺段）用全部 decoding slot 的 token 和 context；
+    深段的 token 數與 KV 讀取量只算會驗證的 slot：R(s) 用 d ≥ 1 的 slot，R(s+1) 用 d + 1 之後的全部 slot（context 各多 1）。
   - 強制驗證：任何 d_i ≥ d_max，或已等待 `--sla-steps` 步。
   - 所有 d_i ≥ 1 的 request 一定驗證；d_i = 0 的在同一步 draft。
   - α 用 ASPIRE 的 EMA 更新（ω = 0.8，α0 = 0.9）。

@@ -102,9 +102,11 @@ class _Base:
     def t_sh(self, B, k: int, C):
         return self.t_segment(k, B, C) + self.head_ms(B)
 
-    def t_deep(self, n, k: int, C, n_req, buckets: int = 1):
-        """Deep step: latest draft of every verifier through [0,k), all n tokens through [k,L), head on n."""
-        return (self.t_segment(k, n_req, C) + self.t_segment(self.dims.n_layers - k, n, C, buckets) + self.head_ms(n))
+    def t_deep(self, n, k: int, C, n_req, buckets: int = 1, C_deep=None):
+        """Deep step: n_req tokens (the step's shallow segment) through [0,k) reading C cached positions,
+        n verify tokens through [k,L) reading C_deep positions (default C), head on n."""
+        Cd = C if C_deep is None else C_deep
+        return (self.t_segment(k, n_req, C) + self.t_segment(self.dims.n_layers - k, n, Cd, buckets) + self.head_ms(n))
 
     def t_prefill(self, n, C):
         return self.t_segment(self.dims.n_layers, n, C) + self.head_ms(1)

@@ -9,8 +9,8 @@ Every scheduler sees the decoding slots' state before a step and returns the ver
             homogeneous-batch cost ratio t_sh / t_deep; a slot verifies on its own when it
             reaches its target (independent scheduling, observation O6).
     m1      mechanism 1 (batch-level trigger): after every step compare
-                R(s)   = sum_i E_i(d_i)   / (s t_sh     + t_deep(sum_i (d_i+1)))
-                R(s+1) = sum_i E_i(d_i+1) / ((s+1) t_sh + t_deep(sum_i (d_i+2)))
+                R(s)   = sum_{i: d_i>=1} E_i(d_i) / (s t_sh + t_deep(sum_{d_i>=1}(d_i+1); KV of the d_i>=1 slots))
+                R(s+1) = sum_i E_i(d_i+1)        / ((s+1) t_sh + t_deep(sum_i (d_i+2); KV of all slots))
             E_i(d) = (1 - a_i^(d+1)) / (1 - a_i); draft once more if R(s+1) > R(s), else run the
             deep step.  Forced when any d_i >= d_max or after --sla-steps steps without a deep step.
             Every slot with d_i >= 1 verifies; slots with d_i = 0 draft in the same step.
@@ -118,18 +118,29 @@ class M1Scheduler(Scheduler):
         self.sla_steps = sla_steps
 
     def rates(self, d, ctx, dec, s):
-        """(R(s), R(s+1)) for the current state (exposed for tests / logging)."""
+        """(R(s), R(s+1)) for the current state (exposed for tests / logging).
+        Shallow terms (every shallow step and the deep step's shallow segment) cover all decoding slots;
+        the deep segment's tokens and KV reads cover only the slots that would verify: d >= 1 now, and
+        after one more draft every decoding slot (d + 1 >= 1, contexts one token longer)."""
         dd = d[dec]
-        al = self.ema.alpha[dec]
+        cc = ctx[dec].astype(np.float64)
+        al = self._alpha(dec)
         n = len(dd)
-        C = float(ctx[dec].sum())
+        C = float(cc.sum())
         t_sh = float(self.cm.t_sh(n, self.k, C))
         ver = dd >= 1
-        e_now = float(expected_tokens(al[ver], dd[ver]).sum())
-        t_now = s * t_sh + float(self.cm.t_deep(int((dd[ver] + 1).sum()), self.k, C, int(ver.sum())))
-        e_next = float(expected_tokens(al, dd + 1).sum())
-        t_next = (s + 1) * t_sh + float(self.cm.t_deep(int((dd + 2).sum()), self.k, C, n))
+        e_now = float(self._expected(dec, dd)[ver].sum())
+        t_now = s * t_sh + float(self.cm.t_deep(int((dd[ver] + 1).sum()), self.k, C, n, C_deep=float(cc[ver].sum())))
+        e_next = float(self._expected(dec, dd + 1).sum())
+        t_next = (s + 1) * t_sh + float(self.cm.t_deep(int((dd + 2).sum()), self.k, C + n, n, C_deep=C + n))
         return e_now / max(t_now, 1e-9), e_next / max(t_next, 1e-9)
+
+    def _alpha(self, dec):
+        return self.ema.alpha[dec]
+
+    def _expected(self, dec, d):
+        """Expected committed tokens per decoding slot if it verifies with d drafts (hook for m1-oracle)."""
+        return expected_tokens(self._alpha(dec), d)
 
     def decide(self, d, ctx, dec, steps_since_deep):
         ver = dec & (d >= 1)

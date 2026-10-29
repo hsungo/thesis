@@ -374,3 +374,35 @@ def test_wall_clock_metrics(tiny_model, ar_ref):
         assert m["wall_s"] >= gpu_s * 0.999                      # wall clock covers the GPU (here: CPU) time
         assert 0.0 <= m["host_overhead_share"] < 1.0
         assert m["wall_throughput_tok_s"] <= m["e2e_throughput_tok_s"] * 1.001
+
+
+# ------------------------------------------------------------------------------ M1 deep cost of verifiers only (item 3)
+
+def test_m1_deep_cost_counts_only_verifying_slots():
+    from common.model import ModelConfig
+    from solutions.cost_model import synthetic_cost_model
+    from solutions.schedulers import M1Scheduler
+
+    cfg = ModelConfig(vocab_size=128256, dim=4096, n_layers=32, n_heads=32, n_kv_heads=8, head_dim=128,
+                      intermediate_size=14336, norm_eps=1e-5, rope_theta=5e5, max_position_embeddings=8192)
+    cm = synthetic_cost_model(cfg)
+    calls = []
+    orig = cm.t_deep
+
+    def spy(n, k, C, n_req, buckets=1, C_deep=None):
+        calls.append({"n": n, "C": C, "n_req": n_req, "C_deep": C_deep})
+        return orig(n, k, C, n_req, buckets, C_deep)
+    cm.t_deep = spy
+    d = np.array([3, 3, 0, 0])
+    ctx = np.array([100, 200, 5000, 7000])                  # newcomers (d = 0) with long contexts
+    dec = np.ones(4, dtype=bool)
+    s = M1Scheduler(4, cm, 3, d_max=16)
+    s.rates(d, ctx, dec, 3)
+    now, nxt = calls
+    assert now["n"] == 8 and now["C_deep"] == 300           # only the two d >= 1 slots: tokens and KV
+    assert now["n_req"] == 4 and now["C"] == 12300          # shallow segment: every decoding slot
+    assert nxt["n"] == (3 + 2) * 2 + (0 + 2) * 2 and nxt["C_deep"] == 12300 + 4
+    # the deep term really changes with it: long d = 0 contexts must not make verifying now look slower
+    t_only = float(orig(8, 3, 12300, 4, C_deep=300))
+    t_all = float(orig(8, 3, 12300, 4, C_deep=12300))
+    assert t_only < t_all
