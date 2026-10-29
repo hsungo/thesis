@@ -8,6 +8,7 @@ Every scheduler sees the decoding slots' state before a step and returns the ver
     aspire  ASPIRE: per-request target draft length from an EMA acceptance estimate and the
             homogeneous-batch cost ratio t_sh / t_deep; a slot verifies on its own when it
             reaches its target (independent scheduling, observation O6).
+    fsm-sync, aspire-fsm, m1-oracle   comparison / diagnostic schedulers (see their classes)
     m1      mechanism 1 (batch-level trigger): after every step compare
                 R(s)   = sum_{i: d_i>=1} E_i(d_i) / (s t_sh + t_deep(sum_{d_i>=1}(d_i+1); KV of the d_i>=1 slots))
                 R(s+1) = sum_i E_i(d_i+1)        / ((s+1) t_sh + t_deep(sum_i (d_i+2); KV of all slots))
@@ -152,8 +153,90 @@ class M1Scheduler(Scheduler):
         return ver if r_next <= r_now else np.zeros_like(ver)
 
 
+class SyncFSMScheduler(FixedScheduler):
+    """fsm-sync (comparison): synchronous rounds with one batch-wide gamma.  After every deep step:
+    more than half of the verifiers fully accepted -> gamma + 1, otherwise gamma - 1, within [1, d_max]."""
+    name = "fsm-sync"
+
+    def observe(self, verify, accepted, drafts) -> None:
+        super().observe(verify, accepted, drafts)
+        ver = verify & (drafts > 0)
+        if ver.any():
+            full = int((accepted[ver] >= drafts[ver]).sum())
+            self.gamma = int(np.clip(self.gamma + (1 if full > 0.5 * int(ver.sum()) else -1), 1, self.d_max))
+        self.gamma_hist.append(self.gamma)
+
+    def __init__(self, *a, **kw):
+        super().__init__(*a, **kw)
+        self.gamma_hist = [self.gamma]
+
+
+class AspireFSMScheduler(Scheduler):
+    """aspire-fsm (comparison): ASPIRE's FeedbackPolicy - every request keeps its own target draft length,
+    +1 after a fully accepted round, -1 otherwise (within [1, d_max]), and verifies on its own when its
+    drafts reach the target (independent scheduling)."""
+    name = "aspire-fsm"
+
+    def __init__(self, B, cost_model, k, initial_draft: int = 3, **kw):
+        super().__init__(B, cost_model, k, **kw)
+        self.initial_draft = initial_draft
+        self.targets = np.full(B, initial_draft, dtype=np.int64)
+
+    def decide(self, d, ctx, dec, steps_since_deep):
+        return dec & (d >= 1) & ((d >= self.targets) | (d >= self.d_max))
+
+    def observe(self, verify, accepted, drafts) -> None:
+        super().observe(verify, accepted, drafts)
+        ids = np.flatnonzero(verify & (drafts > 0))
+        if ids.size:
+            full = accepted[ids] >= drafts[ids]
+            self.targets[ids] = np.clip(np.where(full, self.targets[ids] + 1, self.targets[ids] - 1), 1, self.d_max)
+
+    def reset(self, slot: int) -> None:
+        super().reset(slot)
+        self.targets[slot] = self.initial_draft
+
+
+class OracleM1Scheduler(M1Scheduler):
+    """m1-oracle (diagnostic, not a method): the M1 rule with E_i(d) replaced by the true number of
+    tokens a verification with d drafts would commit, read from a stored AR reference of the same
+    prompts (tokens + whether the exit-k draft agrees with AR at every position, see
+    solutions/make_ref.py).  A request whose committed output has left its reference (bf16 batch-shape
+    divergence) falls back to the EMA estimate; the share of oracle answers is reported."""
+    name = "m1-oracle"
+
+    def __init__(self, B, cost_model, k, ref: dict, **kw):
+        super().__init__(B, cost_model, k, **kw)
+        if not ref:
+            raise ValueError("m1-oracle needs AR reference outputs (python -m solutions.make_ref ...)")
+        self.ref = ref                    # pid -> (tokens list, run-length array at exit k)
+        self.engine = None
+        self.oracle_answers = 0
+        self.fallback_answers = 0
+
+    def bind(self, engine) -> None:
+        self.engine = engine
+
+    def _expected(self, dec, d):
+        est = expected_tokens(self._alpha(dec), d)
+        out = np.array(est, dtype=np.float64)
+        for j, slot in enumerate(np.flatnonzero(dec)):
+            r = self.engine.req[slot]
+            ent = self.ref.get(r.pid) if r is not None else None
+            c = len(r.out) if r is not None else 0
+            if ent is not None and c < len(ent[0]) and r.out == ent[0][:c]:
+                out[j] = min(min(int(ent[1][c]), int(d[j])) + 1, len(ent[0]) - c)
+                self.oracle_answers += 1
+            else:
+                self.fallback_answers += 1
+        return out
+
+
+SCHEDULERS = ("fixed", "aspire", "m1", "fsm-sync", "aspire-fsm", "m1-oracle")
+
+
 def make_scheduler(name: str, B: int, cost_model, k: int, *, gamma: int = 4, d_max: int = 16, sla_steps: int = 32,
-                   initial_draft: int = 3, omega: float = 0.8, alpha0: float = 0.9) -> Scheduler:
+                   initial_draft: int = 3, omega: float = 0.8, alpha0: float = 0.9, ref: dict | None = None) -> Scheduler:
     kw = dict(d_max=d_max, omega=omega, alpha0=alpha0)
     if name == "fixed":
         return FixedScheduler(B, cost_model, k, gamma, **kw)
@@ -161,4 +244,10 @@ def make_scheduler(name: str, B: int, cost_model, k: int, *, gamma: int = 4, d_m
         return AspireScheduler(B, cost_model, k, initial_draft=initial_draft, **kw)
     if name == "m1":
         return M1Scheduler(B, cost_model, k, sla_steps=sla_steps, **kw)
-    raise ValueError(f"unknown scheduler {name!r}")
+    if name == "fsm-sync":
+        return SyncFSMScheduler(B, cost_model, k, gamma, **kw)
+    if name == "aspire-fsm":
+        return AspireFSMScheduler(B, cost_model, k, initial_draft=initial_draft, **kw)
+    if name == "m1-oracle":
+        return OracleM1Scheduler(B, cost_model, k, ref, sla_steps=sla_steps, **kw)
+    raise ValueError(f"unknown scheduler {name!r}; known: {SCHEDULERS}")

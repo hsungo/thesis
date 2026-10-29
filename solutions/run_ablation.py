@@ -18,6 +18,9 @@ Configurations (``--configs``):
     fixed-g<g>               synchronous, gamma g, exit k (``--k``), separate prefill
     fixed-g<g>-k<k>          same with exit layer k (k sweep)
     aspire                   ASPIRE per-request scheduling
+    fsm-sync                 synchronous, one batch gamma: >half of verifiers fully accepted -> +1, else -1
+    aspire-fsm               ASPIRE FeedbackPolicy: per-request target +-1, per-request verification
+    m1-oracle                diagnostic: M1 with true acceptance from AR references (solutions/make_ref.py)
     m1                       +M1      m1-linear   M1 with the linear (ASPIRE 3-parameter) cost model
     m2                       +M2 (fixed gamma = --base-gamma)
     m3                       +M3 (fixed gamma = --base-gamma)
@@ -47,6 +50,7 @@ DATASETS = ("cnn_dm_summarization", "xsum_summarization", "human_eval", "gsm8k")
 MODELS = ("layerskip-llama3-1B", "layerskip-llama2-7B", "layerskip-llama3-8B")
 BASE = ["ar", "fixed-g2", "fixed-g3", "fixed-g4", "fixed-g6", "fixed-g8", "aspire"]
 MECH = ["m1", "m2", "m3", "m1+m2", "m1+m3", "m2+m3", "all", "m1-linear"]
+COMPARE = ["fsm-sync", "aspire-fsm", "m1-oracle"]      # comparison schedulers + oracle diagnostic
 
 PRESETS = {
     "smoke": dict(models=["layerskip-llama3-1B"], datasets=["gsm8k"], lengths=[256], batch_sizes=[4],
@@ -54,7 +58,8 @@ PRESETS = {
     "phase0": dict(models=["layerskip-llama3-8B"], datasets=list(DATASETS), lengths=[512],
                    batch_sizes=[1, 4, 8, 16, 32], configs=BASE, reps=1),
     "phase1": dict(models=["layerskip-llama3-8B"], datasets=list(DATASETS), lengths=[512],
-                   batch_sizes=[1, 4, 8, 16, 32], configs=["ar", "fixed-g4", "aspire", "m1", "m1-linear"], reps=1),
+                   batch_sizes=[1, 4, 8, 16, 32], configs=["ar", "fixed-g4", "aspire", "m1", "m1-linear"] + COMPARE,
+                   reps=1),
     "ksweep": dict(models=["layerskip-llama3-8B"], datasets=list(DATASETS), lengths=[512], batch_sizes=[1, 4, 8, 16, 32],
                    configs=["ar"] + [f"fixed-g{g}-k{k}" for k in range(2, 9) for g in (3, 4)], reps=1),
     "phase2": dict(models=["layerskip-llama3-8B"], datasets=list(DATASETS), lengths=[512],
@@ -64,7 +69,7 @@ PRESETS = {
     "phase3": dict(models=["layerskip-llama3-8B"], datasets=list(DATASETS), lengths=[512],
                    batch_sizes=[1, 4, 8, 16, 32], configs=["ar", "fixed-g4", "m1", "m3", "m1+m3"], reps=1),
     "full": dict(models=list(MODELS), datasets=list(DATASETS), lengths=[256, 512, 1024], batch_sizes=[1, 4, 8, 16, 32],
-                 configs=BASE + MECH, reps=3),
+                 configs=BASE + MECH + COMPARE, reps=3),
     "poisson": dict(models=["layerskip-llama3-8B"], datasets=["cnn_dm_summarization", "gsm8k"], lengths=[512],
                     batch_sizes=[32], configs=["ar", "fixed-g4", "aspire", "m1", "m3", "all"], reps=3,
                     poisson_loads=[0.5, 0.8, 1.0]),
@@ -90,6 +95,8 @@ def engine_config(name: str, args):
         return EngineConfig(sched="fixed", **base), cost
     if name == "aspire":
         return EngineConfig(sched="aspire", **base), cost
+    if name in ("fsm-sync", "aspire-fsm", "m1-oracle"):
+        return EngineConfig(sched=name, **base), cost
     if name == "m1-linear":
         return EngineConfig(sched="m1", **base), "linear"
     mech = {"m1": ("m1", "fixed", "separate"), "m2": ("fixed", "m2", "separate"), "m3": ("fixed", "fixed", "m3"),
@@ -189,10 +196,21 @@ def run(args) -> None:
                             cfg, cost = engine_config(cname, args)
                             if cfg.k >= model.n_layers or cost not in cms:
                                 continue
+                            ref = None
+                            if cfg.sched == "m1-oracle":       # error out if the AR reference is missing
+                                from solutions.make_ref import load_ref, ref_path
+                                rp = ref_path(args.ref_dir, model_name, ds, L)
+                                if not rp.exists():
+                                    raise SystemExit(
+                                        f"m1-oracle: missing AR reference {rp}\n  create it with: python -m "
+                                        f"solutions.make_ref --model {model_name} --datasets {ds} --lengths {L} "
+                                        f"--max-new-tokens {args.max_new_tokens} --prompts-per-workload "
+                                        f"{args.prompts_per_workload} --length-mode {args.length_mode} --seed {args.seed}")
+                                ref = load_ref(rp, cfg.k)
                             t0 = time.time()
                             try:
                                 eng = EESDEngine(model, B, max_p, args.max_new_tokens, eos, cfg, cms[cost],
-                                                 stop_for=lambda pid: stops.get(pid.split("/")[0]))
+                                                 stop_for=lambda pid: stops.get(pid.split("/")[0]), ref=ref)
                                 if args.poisson_loads:
                                     res = run_poisson_series(eng, prompts, args, max_p, B, rep)
                                 else:
@@ -264,7 +282,8 @@ def summarize(out: Path) -> None:
                                               "tokens_per_deep_step", "verifiers_per_deep_step", "acceptance_rate",
                                               "k_final", "plan_ms_per_step", "ttft_ms_mean", "ttft_ms_p99", "tpot_ms_mean",
                                               "tpot_ms_p99", "prefill_time_share", "piggyback_share_of_prefill_tokens",
-                                              "m3_fallbacks", "probe_steps", "evaluated_completions", "stop_reason")},
+                                              "m3_fallbacks", "probe_steps", "oracle_coverage", "gamma_final",
+                                              "evaluated_completions", "stop_reason")},
                      "k_switches": max(len(m.get("k_timeline") or []) - 1, 0)})
         if "poisson" in d:
             for lab, pm in d["poisson"].items():
@@ -391,6 +410,7 @@ def main() -> None:
     ap.add_argument("--max-eval", type=int, default=256)
     ap.add_argument("--keep-outputs", action="store_true", help="store generated tokens (token agreement with AR)")
     ap.add_argument("--calibration-dir", default=str(RESULTS / "calibration"))
+    ap.add_argument("--ref-dir", default=str(RESULTS / "ref"), help="AR references for m1-oracle (solutions/make_ref.py)")
     ap.add_argument("--out", default=None)
     ap.add_argument("--device", default=None)
     ap.add_argument("--dtype", default="bf16")

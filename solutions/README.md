@@ -13,10 +13,11 @@
 | `engine.py` | 合併執行引擎 `EESDEngine`（shallow / deep step、KV 長度指標回滾、CPU 端 NumPy 狀態），以及三種 driver：cyclic replay（ASPIRE 協定）、static（每個 prompt 一次）、Poisson 到達 |
 | `packed.py` | 不等長批次：token 接成一條，用 `qo_indptr = cumsum(d_i+1)` 分段。GEMM / MLP / head 不做 padding；attention 依 query 長度分桶（`exact`：同長度一桶，完全不 pad；`pad`：每段一桶） |
 | `cost_model.py` | 可攜式 roofline 成本模型：`t_layer(n,C) = max(W/BW, 2·P·n/F_eff) + KV(C)/BW + n_op·t_op`。提供 `t_sh / t_deep / t_prefill / t_segment / knee`，GEMM 項啟動時先查表；`knee()` 回傳實測膝點。另有 `roofline-peak`（舊版：8192³ 峰值 F 與解析膝點，只用於比較 MAPE）和 ASPIRE 式 3 參數線性模型（消融用） |
-| `schedulers.py` | `--sched fixed / aspire / m1` |
+| `schedulers.py` | `--sched fixed / aspire / m1`，以及比較對象 `fsm-sync / aspire-fsm / m1-oracle` |
 | `exit_select.py` | `--exit m2`（整批共用、動態選擇退出層） |
 | `prefill.py` | `--prefill separate / m3`（依深度拆開的 prefill 搭載） |
 | `calibrate.py` | 每台 GPU、每個模型量一次 BW、峰值 F、**F_eff**（模型自己的 QKV/O/W13/W2 形狀在 n = 1..512 的最高有效算力）、**knee_measured**（一層 decoder 在 n = 1..512 的實測時間做 hinge 擬合）、t_op、n_op 和線性擬合，存成 JSON；`--validate` 量實際 step 時間，報告 roofline（新）、roofline_peak（舊）、linear 三者的 MAPE，並單獨報告 n = 64..256 這一段 |
+| `make_ref.py` | 產生 m1-oracle 用的 AR 參考輸出（每個位置的 AR token，以及 exit 2..8 的 draft 是否等於它），存在 `results/eesd/ref/<model>/<task>_L<len>.npz` |
 | `check_lossless.py` | 實機無損檢查：每種開關組合都和 AR 比對（fp32 要完全一致；bf16 回報一致率與 AR 自身的下限） |
 | `run_ablation.py` | 量測與消融（presets、CSV、平均 ± 標準差摘要表，可續跑） |
 
@@ -67,6 +68,13 @@ CPU 測試在 `tests/test_eesd.py`（`python -m pytest`，不需要 GPU），涵
   - 最後一塊做完時產生第一個 token，該 request 從 d = 0 開始 draft。
   - 退回一般 prefill 的條件（在 request 進入 slot 時判斷）：沒有低於膝點的空間、需要超過 `--max-wait` 個 deep step，或成本模型估計 Δt(c) ≥ 另外跑的時間。原因記在 `m3_fallback_reasons`。
   - 若所有 slot 都還在 prefill（沒有 decoding slot），會直接在同一步把整塊跑完深淺兩段，避免卡住。
+
+## 比較對象（不是方法）
+| config | 說明 |
+|---|---|
+| `fsm-sync` | 同步回合，整批共用一個 γ（起始 `--base-gamma`）。每次 deep step 後，超過一半的驗證者全部接受 → γ + 1，否則 γ − 1，限制在 [1, d_max] |
+| `aspire-fsm` | ASPIRE 的 FeedbackPolicy：每個 request 各自的目標長度（起始 3），全部接受 +1、否則 −1，各自觸發驗證 |
+| `m1-oracle` | 診斷用：決策規則和 M1 相同，但 E_i(d) 換成真實的確認 token 數 min(run_i, d) + 1。run_i 來自事先存好的 AR 參考輸出（`make_ref.py`，同一批 prompt），因此不需要額外的 GPU 同步。bf16 下輸出偏離參考時，該 request 改用 α 估計，比例記在 `oracle_coverage`。找不到參考輸出時直接報錯並印出產生指令。只能搭配固定 exit |
 
 已知限制（會影響量測，請在論文中寫明）：
 - 沒有 FlashInfer / flash-attn，attention 用 SDPA。

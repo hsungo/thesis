@@ -48,7 +48,7 @@ FREE, PREFILL, DECODE = 0, 1, 2
 @dataclass
 class EngineConfig:
     mode: str = "spec"              # spec | ar
-    sched: str = "fixed"            # fixed | aspire | m1
+    sched: str = "fixed"            # fixed | aspire | m1 | fsm-sync | aspire-fsm | m1-oracle
     gamma: int = 4
     k: int = 3
     exit: str = "fixed"             # fixed | m2
@@ -113,9 +113,11 @@ class Rec:
 
 class EESDEngine:
     def __init__(self, model, B: int, max_prompt: int, max_new: int, eos_ids, cfg: EngineConfig, cost_model,
-                 stop_for: Optional[Callable] = None):
+                 stop_for: Optional[Callable] = None, ref: Optional[dict] = None):
         if cfg.mode == "ar" and cfg.prefill != "separate":
             raise ValueError("AR mode supports --prefill separate only")
+        if cfg.sched == "m1-oracle" and cfg.exit != "fixed":
+            raise ValueError("m1-oracle needs a fixed exit layer (its reference is per exit layer)")
         self.m, self.dev, self.B, self.cfg, self.cm = model, model.device, B, cfg, cost_model
         self.max_new, self.eos = max_new, set(eos_ids)
         self.stop_for = stop_for or (lambda pid: None)
@@ -137,7 +139,9 @@ class EESDEngine:
         self.records: list[Rec] = []
         self.sched = make_scheduler(cfg.sched, B, cost_model, self.k, gamma=cfg.gamma, d_max=Dm,
                                     sla_steps=cfg.sla_steps, initial_draft=cfg.initial_draft, omega=cfg.omega,
-                                    alpha0=cfg.alpha0) if cfg.mode == "spec" else None
+                                    alpha0=cfg.alpha0, ref=ref) if cfg.mode == "spec" else None
+        if hasattr(self.sched, "bind"):
+            self.sched.bind(self)
         self.exitc = ExitController(cost_model, self.k, [c for c in cfg.k_cands if 1 <= c < self.L], cfg.probe_every,
                                     cfg.switch_margin, cfg.omega, Dm, cfg.m2_force) if cfg.exit == "m2" else None
         self.m3 = M3Planner(cost_model, cfg.max_wait, cfg.m3_chunk_cap, cfg.prefill_chunk, cfg.knee_safety) if cfg.prefill == "m3" else None
@@ -722,6 +726,9 @@ class EESDEngine:
             "k_alpha": self.exitc.alpha if self.exitc else None,
             "probe_steps": st["probe_steps"], "dropped_drafts_at_switch": st["dropped_drafts"],
             "m3_fallbacks": st["m3_fallbacks"], "m3_fallback_reasons": dict(self.fallback_reasons),
+            "oracle_coverage": (self.sched.oracle_answers / max(self.sched.oracle_answers + self.sched.fallback_answers, 1)
+                                if hasattr(self.sched, "oracle_answers") else None),
+            "gamma_final": getattr(self.sched, "gamma", None) if self.sched is not None else None,
             "separate_prefills": st["separate_prefills"],
             "evaluated_completions": sum(1 for c in completions if c["measured"]),
             "steps": st["steps"], "deep_steps": st["deep_steps"],

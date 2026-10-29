@@ -277,12 +277,12 @@ def test_cost_model_formula_and_io(tmp_path):
 def test_ablation_config_names():
     import argparse
 
-    from solutions.run_ablation import BASE, MECH, engine_config
+    from solutions.run_ablation import BASE, COMPARE, MECH, engine_config
 
     args = argparse.Namespace(k=3, d_max=16, sla_steps=32, probe_every=20, k_cands=[2, 3, 4], switch_margin=0.05,
                               max_wait=3, knee_safety=0.9, prefill_chunk=512, bucketing="exact", base_gamma=4)
     seen = {}
-    for name in BASE + MECH + ["fixed-g3-k6"]:
+    for name in BASE + MECH + COMPARE + ["fixed-g3-k6"]:
         cfg, cost = engine_config(name, args)
         seen[name] = (cfg.mode, cfg.sched, cfg.exit, cfg.prefill, cfg.gamma, cfg.k, cost)
     assert seen["ar"][0] == "ar"
@@ -291,6 +291,7 @@ def test_ablation_config_names():
     assert seen["all"][1:4] == ("m1", "m2", "m3")
     assert seen["m2+m3"][1:4] == ("fixed", "m2", "m3")
     assert seen["m1-linear"][1] == "m1" and seen["m1-linear"][6] == "linear"
+    assert [seen[c][1] for c in COMPARE] == ["fsm-sync", "aspire-fsm", "m1-oracle"]
 
 
 def test_ablation_summary_pairs_with_ar(tmp_path):
@@ -406,3 +407,92 @@ def test_m1_deep_cost_counts_only_verifying_slots():
     t_only = float(orig(8, 3, 12300, 4, C_deep=300))
     t_all = float(orig(8, 3, 12300, 4, C_deep=12300))
     assert t_only < t_all
+
+
+# ------------------------------------------------------------------------------ comparison schedulers (item 4)
+
+@pytest.fixture(scope="module")
+def tiny_ref(tiny_model, ar_ref, tmp_path_factory):
+    """AR reference (tokens + exit agreement) of the test prompts, written and read like solutions/make_ref.py."""
+    from common.engine import ARBatchEngine, RunConfig
+    from common.traces import ExitProbe
+    from solutions.make_ref import load_ref
+
+    prompts, _ = ar_ref
+    eng = ARBatchEngine(tiny_model, 2, 24, MAX_NEW, (2,), ignore_eos=True)
+    probe = ExitProbe(tiny_model, list(range(1, tiny_model.n_layers + 1)))
+    eng.probe = probe
+    eng.run(prompts, RunConfig(mode="static"))
+    path = probe.save(tmp_path_factory.mktemp("ref") / "ref.npz", {"n_layers": tiny_model.n_layers})
+    return path, load_ref
+
+
+@pytest.mark.parametrize("sched,exit_,prefill", [(s, e, p) for s in ("fsm-sync", "aspire-fsm")
+                                                 for e in ("fixed", "m2") for p in ("separate", "m3")]
+                         + [("m1-oracle", "fixed", p) for p in ("separate", "m3")])
+def test_comparison_schedulers_are_lossless(tiny_model, ar_ref, tiny_ref, sched, exit_, prefill):
+    from solutions.cost_model import synthetic_cost_model
+    from solutions.engine import EESDEngine
+
+    prompts, ref = ar_ref
+    path, load_ref = tiny_ref
+    cfg = _cfg(sched=sched, exit=exit_, prefill=prefill, m2_force="cycle" if exit_ == "m2" else None)
+    eng = EESDEngine(tiny_model, 3, 24, MAX_NEW, (), cfg, synthetic_cost_model(tiny_model.cfg),
+                     ref=load_ref(path, cfg.k) if sched == "m1-oracle" else None)
+    res = eng.run(prompts, "static", keep_outputs=True)
+    assert _outputs(res) == ref
+    if sched == "m1-oracle":
+        assert res["metrics"]["oracle_coverage"] == 1.0        # fp32: outputs never leave the reference
+
+
+def test_fsm_sync_gamma_rule():
+    from common.model import ModelConfig
+    from solutions.cost_model import synthetic_cost_model
+    from solutions.schedulers import SyncFSMScheduler
+
+    cfg = ModelConfig(vocab_size=1000, dim=64, n_layers=6, n_heads=4, n_kv_heads=2, head_dim=16,
+                      intermediate_size=128, norm_eps=1e-5, rope_theta=1e4, max_position_embeddings=512)
+    s = SyncFSMScheduler(4, synthetic_cost_model(cfg), 2, 4, d_max=6)
+    v = np.ones(4, dtype=bool)
+    d = np.full(4, 4)
+    s.observe(v, np.array([4, 4, 4, 1]), d)                   # 3 of 4 fully accepted -> +1
+    assert s.gamma == 5
+    s.observe(v, np.array([4, 4, 1, 1]), d)                   # exactly half -> -1
+    assert s.gamma == 4
+    for _ in range(10):
+        s.observe(v, d, d)
+    assert s.gamma == 6                                       # capped at d_max
+    for _ in range(10):
+        s.observe(v, np.zeros(4, dtype=int), d)
+    assert s.gamma == 1                                       # floored at 1
+    dec = np.ones(4, dtype=bool)
+    assert not s.decide(np.ones(4, dtype=int), np.full(4, 10), dec, 0).any()
+    assert s.decide(np.ones(4, dtype=int), np.full(4, 10), dec, 1).all()
+
+
+def test_aspire_fsm_targets_are_per_request():
+    from common.model import ModelConfig
+    from solutions.cost_model import synthetic_cost_model
+    from solutions.schedulers import AspireFSMScheduler
+
+    cfg = ModelConfig(vocab_size=1000, dim=64, n_layers=6, n_heads=4, n_kv_heads=2, head_dim=16,
+                      intermediate_size=128, norm_eps=1e-5, rope_theta=5e5, max_position_embeddings=512)
+    s = AspireFSMScheduler(3, synthetic_cost_model(cfg), 2, initial_draft=3, d_max=6)
+    v = np.array([True, True, False])
+    s.observe(v, np.array([3, 0, 0]), np.array([3, 3, 3]))
+    assert s.targets.tolist() == [4, 2, 3]
+    dec = np.ones(3, dtype=bool)
+    assert s.decide(np.array([3, 2, 3]), np.full(3, 10), dec, 0).tolist() == [False, True, True]
+    s.reset(0)
+    assert s.targets[0] == 3
+
+
+def test_m1_oracle_requires_reference(tiny_model):
+    from solutions.cost_model import synthetic_cost_model
+    from solutions.engine import EESDEngine
+    from solutions.make_ref import load_ref
+
+    with pytest.raises(ValueError):
+        EESDEngine(tiny_model, 2, 24, MAX_NEW, (), _cfg(sched="m1-oracle"), synthetic_cost_model(tiny_model.cfg))
+    with pytest.raises(FileNotFoundError):
+        load_ref("/nonexistent/ref.npz", 2)
