@@ -37,8 +37,13 @@ CPU 測試在 `tests/test_eesd.py`（`python -m pytest`，不需要 GPU），涵
 - **回滾**：每個 request 的已確認位置 `pos` 就是 KV 長度指標。被拒 token 的 KV 留在指標之後，不會被讀到（query 只讀 ≤ 自己位置的 KV），下一輪會覆寫，不搬任何資料。
 - **同步**：shallow step 和排程器都不做 GPU→CPU 同步。每個 deep step 只讀回一次，內容是接受數、驗證後的 token、M2 probe 計數、M3 首個 token。
 - **持續補位**：照 ASPIRE 的 cyclic replay。完成即補位；前 max(8, B) 個完成不計；量測至少 max(16, 2B) 個完成，吞吐量變動連續 4 次 < 1% 就停止，最多 256 個。
-- **計時**：每一步的 GPU 時間用 CUDA events。decode-only 吞吐量 = 確認 token 數 / 非 prefill step 的時間（ASPIRE 口徑）；端到端吞吐量含 separate prefill。
+- **計時**：每次執行回報三種吞吐量，speedup 也三種都算（相對同模型、任務、長度、B、重複次數的 AR）：
+  - **decode-only**（`throughput_tok_s`）= 確認 token 數 / 非 prefill step 的 GPU 時間（CUDA events，ASPIRE 口徑）；
+  - **端到端 GPU**（`e2e_throughput_tok_s`）= 確認 token 數 / (decode + separate prefill 的 GPU 時間)；
+  - **牆鐘**（`wall_throughput_tok_s`）= 確認 token 數 / 量測區間的 perf_counter 時間（開始和結束前都 synchronize），包含 step 之間的 Python 處理、規劃與打包。`host_overhead_share = 1 − GPU 時間 / 牆鐘時間`。
+  - 只看 GPU 時間會讓 host 端工作較多的設定（M2、M3）看起來比實際快，比較方法時以牆鐘為準。
   - M3 搭載的 prefill 成本算在 decode step 裡，所以 M3 的 decode-only 吞吐量是保守的。
+  - 收斂判斷仍沿用 decode-only 吞吐量（ASPIRE 協定）。
 
 ## 三個機制
 - **M1（`--sched m1`）**：每一步之後比較

@@ -21,7 +21,8 @@ finished prefills) - shallow steps and the scheduler never synchronise.
 
 Modes: ``mode="spec"`` (sched x exit x prefill switches) and ``mode="ar"`` (all layers, 1 token).
 Drivers: ``run(prompts, "cyclic")`` (ASPIRE cyclic replay: warm-up completions dropped, run until
-the decode throughput converges), ``"static"`` (every prompt once; losslessness tests) and
+the decode throughput converges; besides the CUDA-event GPU time the measured window is also timed
+with perf_counter, synchronised at both ends -> wall_throughput_tok_s, host_overhead_share), ``"static"`` (every prompt once; losslessness tests) and
 ``run_poisson`` (requests arrive by a Poisson process in wall-clock time; B varies over time).
 """
 
@@ -532,6 +533,7 @@ class EESDEngine:
         min_eval_n = max(min_eval, math.ceil(min_eval_per_slot * B))
         max_eval_n = max(max_eval, min_eval_n)
         self.measuring = warmup_n == 0
+        t_wall0 = self._wall_now() if self.measuring else None   # wall clock from the start of measurement
         cursor, total_done, evaluated, stable, anchor, stop_reason = 0, 0, 0, 0, None, None
         completions = []
         rec_measure_start = 0
@@ -574,6 +576,7 @@ class EESDEngine:
                     if total_done >= warmup_n:
                         self.measuring = True
                         rec_measure_start = len(self.records)
+                        t_wall0 = self._wall_now()
                 elif mode == "cyclic":
                     evaluated += 1
                     if evaluated >= min_eval_n:
@@ -600,7 +603,8 @@ class EESDEngine:
                 break
         if self.dev.type == "cuda":
             torch.cuda.synchronize(self.dev)
-        return self._result(completions, rec_measure_start, tok_measured, stop_reason)
+        wall_s = time.perf_counter() - t_wall0 if t_wall0 is not None else None
+        return self._result(completions, rec_measure_start, tok_measured, stop_reason, wall_s)
 
     def run_poisson(self, prompts: list, rate_per_s: float, n_requests: int, warm_requests: int = 8, seed: int = 0,
                     keep_outputs: bool = False) -> dict:
@@ -644,12 +648,10 @@ class EESDEngine:
                 if not self.measuring and total_done >= warm_requests:
                     self.measuring = True
                     rec_measure_start = len(self.records)
-                    t_meas = time.perf_counter()
+                    t_meas = self._wall_now()
         if self.dev.type == "cuda":
             torch.cuda.synchronize(self.dev)
-        res = self._result(completions, rec_measure_start, tok_measured, "n_requests")
-        wall = time.perf_counter() - t_meas
-        res["metrics"]["wall_throughput_tok_s"] = tok_measured / wall if wall > 0 else None
+        res = self._result(completions, rec_measure_start, tok_measured, "n_requests", time.perf_counter() - t_meas)
         res["metrics"]["poisson_rate_per_s"] = rate_per_s
         res["metrics"]["queue_left"] = len(queue)
         return res
@@ -667,7 +669,13 @@ class EESDEngine:
             c["tokens"] = list(r.out)
         return c
 
-    def _result(self, completions, start, tokens, stop_reason) -> dict:
+    def _wall_now(self) -> float:
+        """Wall-clock timestamp after draining the GPU queue (so the window covers host + device time)."""
+        if self.dev.type == "cuda":
+            torch.cuda.synchronize(self.dev)
+        return time.perf_counter()
+
+    def _result(self, completions, start, tokens, stop_reason, wall_s=None) -> dict:
         recs = self.records
         ms = np.array([r.ms for r in recs])
         cum = np.concatenate([[0.0], np.cumsum(ms)])
@@ -692,6 +700,10 @@ class EESDEngine:
             "measured_tokens": tokens, "decode_ms": decode_ms, "prefill_ms": prefill_ms,
             "throughput_tok_s": tokens / (decode_ms / 1000) if decode_ms else None,
             "e2e_throughput_tok_s": tokens / ((decode_ms + prefill_ms) / 1000) if decode_ms + prefill_ms else None,
+            # wall clock: GPU time + host work between steps (Python, planning, packing), prefill included
+            "wall_s": wall_s,
+            "wall_throughput_tok_s": tokens / wall_s if wall_s else None,
+            "host_overhead_share": (1 - (decode_ms + prefill_ms) / (1000 * wall_s)) if wall_s else None,
             "prefill_time_share": prefill_ms / (decode_ms + prefill_ms) if decode_ms + prefill_ms else None,
             "prefill_tokens_separate": st["prefill_tokens"], "prefill_tokens_piggyback": st["piggyback_tokens"],
             "piggyback_share_of_prefill_tokens": st["piggyback_tokens"] / max(st["piggyback_tokens"] + st["prefill_tokens"], 1),

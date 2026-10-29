@@ -22,8 +22,9 @@ Configurations (``--configs``):
     m2                       +M2 (fixed gamma = --base-gamma)
     m3                       +M3 (fixed gamma = --base-gamma)
     m1+m2  m1+m3  m2+m3  all
-Metrics (per run JSON and CSV): decode-only throughput (ASPIRE protocol, prefill excluded), end-to-end
-throughput (prefill included), speedup vs AR (same model / task / length / B / repetition), deep steps per
+Metrics (per run JSON and CSV): decode-only throughput (ASPIRE protocol, prefill excluded), end-to-end GPU
+throughput (prefill included), wall-clock throughput (perf_counter, host work included) and host_overhead_share;
+speedup vs AR for all three (same model / task / length / B / repetition), deep steps per
 token, tokens per deep step, acceptance, exit layer timeline, planning time, TTFT, p99 TPOT, prefill share.
 """
 
@@ -258,7 +259,8 @@ def summarize(out: Path) -> None:
         if toks:
             outputs[(r["model"], r["dataset"], r["length"], r["B"], r["rep"], r["config"])] = toks
         rows.append({**{k: r[k] for k in ("model", "dataset", "length", "B", "config", "cost_model", "rep")},
-                     **{k: m.get(k) for k in ("throughput_tok_s", "e2e_throughput_tok_s", "deep_steps_per_token",
+                     **{k: m.get(k) for k in ("throughput_tok_s", "e2e_throughput_tok_s", "wall_throughput_tok_s",
+                                              "host_overhead_share", "deep_steps_per_token",
                                               "tokens_per_deep_step", "verifiers_per_deep_step", "acceptance_rate",
                                               "k_final", "plan_ms_per_step", "ttft_ms_mean", "ttft_ms_p99", "tpot_ms_mean",
                                               "tpot_ms_p99", "prefill_time_share", "piggyback_share_of_prefill_tokens",
@@ -279,6 +281,8 @@ def summarize(out: Path) -> None:
         r["speedup_vs_ar"] = r["throughput_tok_s"] / a["throughput_tok_s"] if a and a["throughput_tok_s"] and r["throughput_tok_s"] else None
         r["e2e_speedup_vs_ar"] = (r["e2e_throughput_tok_s"] / a["e2e_throughput_tok_s"]
                                   if a and a["e2e_throughput_tok_s"] and r["e2e_throughput_tok_s"] else None)
+        r["wall_speedup_vs_ar"] = (r["wall_throughput_tok_s"] / a["wall_throughput_tok_s"]
+                                   if a and a.get("wall_throughput_tok_s") and r.get("wall_throughput_tok_s") else None)
     for r in rows:                         # bf16 token agreement with AR (runs made with --keep-outputs)
         mine = outputs.get(key(r) + (r["config"],))
         ref = outputs.get(key(r) + ("ar",))
@@ -295,7 +299,8 @@ def summarize(out: Path) -> None:
     for r in rows:
         groups.setdefault((r["model"], r["dataset"], r["length"], r["B"], r["config"]), []).append(r)
     agg = []
-    metrics = ["throughput_tok_s", "e2e_throughput_tok_s", "speedup_vs_ar", "e2e_speedup_vs_ar", "deep_steps_per_token",
+    metrics = ["throughput_tok_s", "e2e_throughput_tok_s", "wall_throughput_tok_s", "speedup_vs_ar", "e2e_speedup_vs_ar",
+               "wall_speedup_vs_ar", "host_overhead_share", "deep_steps_per_token",
                "tokens_per_deep_step", "acceptance_rate", "plan_ms_per_step", "ttft_ms_mean", "tpot_ms_p99",
                "prefill_time_share", "piggyback_share_of_prefill_tokens", "k_switches", "identical_to_ar"]
     for g, rr in sorted(groups.items()):
@@ -323,27 +328,32 @@ def _fmt(m, s, f="{:.2f}"):
 
 def write_tables(out: Path, agg: list) -> None:
     md = ["# EESD measurements (real GPU runs)", "",
-          "Speedup = decode-only throughput (prefill excluded, ASPIRE protocol) / AR of the same model, task, prompt length, "
-          "B and repetition; mean ± std over repetitions.  e2e includes prefill time.", ""]
+          "Three throughputs per run: **decode** = tokens / decode-step GPU time (CUDA events, prefill excluded, "
+          "ASPIRE protocol); **e2e** = tokens / (decode + prefill GPU time); **wall** = tokens / perf_counter wall "
+          "time of the measured window (includes host work between steps).  Each cell gives the speedup vs AR of "
+          "the same model, task, prompt length, B and repetition as `decode / e2e / wall` (mean over repetitions; "
+          "std in summary.csv).  host = 1 - GPU time / wall time.", ""]
     for (model, ds, L) in sorted({(r["model"], r["dataset"], r["length"]) for r in agg}):
         rr = [r for r in agg if (r["model"], r["dataset"], r["length"]) == (model, ds, L)]
         Bs = sorted({r["B"] for r in rr})
         cfgs = list(dict.fromkeys(r["config"] for r in rr))
         md += [f"## {model} · {ds} · prompt {L}", "",
-               "| config | " + " | ".join(f"B={b} speedup" for b in Bs) + " | " + " | ".join(f"B={b} e2e" for b in Bs)
-               + " | deep/token (B=max) | k | plan ms/step |",
-               "|" + "---|" * (2 * len(Bs) + 4)]
+               "| config | " + " | ".join(f"B={b} speedup d / e / w" for b in Bs)
+               + " | decode tok/s (B=max) | e2e tok/s | wall tok/s | host share | deep/token | k | plan ms/step |",
+               "|" + "---|" * (len(Bs) + 8)]
         for c in cfgs:
-            cells, cells2 = [], []
+            cells = []
             for b in Bs:
                 x = next((r for r in rr if r["config"] == c and r["B"] == b), None)
-                cells.append(_fmt(x["speedup_vs_ar_mean"], x["speedup_vs_ar_std"]) if x else "—")
-                cells2.append(_fmt(x["e2e_speedup_vs_ar_mean"], x["e2e_speedup_vs_ar_std"]) if x else "—")
+                cells.append(" / ".join(_fmt(x[f"{m}_mean"], None) for m in
+                                        ("speedup_vs_ar", "e2e_speedup_vs_ar", "wall_speedup_vs_ar")) if x else "—")
             last = next((r for r in sorted(rr, key=lambda r: -r["B"]) if r["config"] == c), None)
-            md.append(f"| {c} | " + " | ".join(cells) + " | " + " | ".join(cells2) + " | "
-                      + (_fmt(last["deep_steps_per_token_mean"], None, "{:.4f}") if last else "—") + " | "
-                      + (last["k_final"] if last else "—") + " | "
-                      + (_fmt(last["plan_ms_per_step_mean"], None, "{:.3f}") if last else "—") + " |")
+            tail = ([_fmt(last[f"{m}_mean"], None, "{:.1f}") for m in
+                     ("throughput_tok_s", "e2e_throughput_tok_s", "wall_throughput_tok_s")]
+                    + [_fmt(last["host_overhead_share_mean"], None, "{:.3f}"),
+                       _fmt(last["deep_steps_per_token_mean"], None, "{:.4f}"), last["k_final"],
+                       _fmt(last["plan_ms_per_step_mean"], None, "{:.3f}")]) if last else ["—"] * 7
+            md.append(f"| {c} | " + " | ".join(cells) + " | " + " | ".join(tail) + " |")
         md.append("")
     (out / "SUMMARY.md").write_text("\n".join(md))
 

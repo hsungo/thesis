@@ -305,14 +305,18 @@ def test_ablation_summary_pairs_with_ar(tmp_path):
             (d / f"{cfg}_rep{rep}.json").write_text(json.dumps({
                 "run": {"model": "M", "dataset": "gsm8k", "length": 256, "B": 4, "config": cfg, "cost_model": "roofline",
                         "rep": rep},
-                "metrics": {"throughput_tok_s": thr, "e2e_throughput_tok_s": thr / 2, "deep_steps_per_token": 0.1,
-                            "k_final": 3, "k_timeline": [[0, 3]]}}))
+                "metrics": {"throughput_tok_s": thr, "e2e_throughput_tok_s": thr / 2, "wall_throughput_tok_s": thr / 4,
+                            "host_overhead_share": 0.5, "deep_steps_per_token": 0.1, "k_final": 3,
+                            "k_timeline": [[0, 3]]}}))
     summarize(tmp_path)
     import csv
     agg = {r["config"]: r for r in csv.DictReader(open(tmp_path / "summary.csv"))}
     assert abs(float(agg["m1"]["speedup_vs_ar_mean"]) - np.mean([180 / 100, 182 / 101])) < 1e-9
     assert float(agg["m1"]["speedup_vs_ar_std"]) > 0
-    assert (tmp_path / "SUMMARY.md").exists()
+    assert abs(float(agg["m1"]["wall_speedup_vs_ar_mean"]) - np.mean([180 / 100, 182 / 101])) < 1e-9
+    assert abs(float(agg["m1"]["e2e_speedup_vs_ar_mean"]) - np.mean([180 / 100, 182 / 101])) < 1e-9
+    md = (tmp_path / "SUMMARY.md").read_text()
+    assert "d / e / w" in md and "wall tok/s" in md
 
 
 # ------------------------------------------------------------------------------ measured knee / F_eff (item 1)
@@ -356,3 +360,17 @@ def test_m3_chunks_respect_measured_knee(tiny_model, ar_ref, safety):
         for n_dp in range(0, 14):
             c = p.budget(n_sh, n_dp, 0)
             assert c == 0 or (c + n_sh <= bound and c + n_dp <= bound)
+
+
+def test_wall_clock_metrics(tiny_model, ar_ref):
+    """Wall-clock throughput / host overhead are reported and consistent with the GPU-time ones."""
+    prompts, _ = ar_ref
+    for mode in ("static", "cyclic"):
+        res = _engine(tiny_model, _cfg(sched="m1")).run(prompts, mode, warmup_samples=2, warmup_per_slot=0, min_eval=4,
+                                                         min_eval_per_slot=0, max_eval=8)
+        m = res["metrics"]
+        assert m["wall_s"] and m["wall_throughput_tok_s"] > 0
+        gpu_s = (m["decode_ms"] + m["prefill_ms"]) / 1000
+        assert m["wall_s"] >= gpu_s * 0.999                      # wall clock covers the GPU (here: CPU) time
+        assert 0.0 <= m["host_overhead_share"] < 1.0
+        assert m["wall_throughput_tok_s"] <= m["e2e_throughput_tok_s"] * 1.001
