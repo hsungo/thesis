@@ -496,3 +496,34 @@ def test_m1_oracle_requires_reference(tiny_model):
         EESDEngine(tiny_model, 2, 24, MAX_NEW, (), _cfg(sched="m1-oracle"), synthetic_cost_model(tiny_model.cfg))
     with pytest.raises(FileNotFoundError):
         load_ref("/nonexistent/ref.npz", 2)
+
+
+# ------------------------------------------------------------------------------ sensitivity preset (item 5)
+
+def test_sensitivity_preset_changes_one_parameter_at_a_time():
+    import argparse
+    import dataclasses
+
+    from solutions.run_ablation import PRESETS, SENS_DEFAULTS, SENSITIVITY, engine_config
+
+    args = argparse.Namespace(k=3, d_max=16, sla_steps=32, probe_every=20, k_cands=[2, 3, 4], switch_margin=0.05,
+                              max_wait=3, knee_safety=0.9, prefill_chunk=512, bucketing="exact", base_gamma=4,
+                              omega=0.8, alpha0=0.9)
+    p = PRESETS["sensitivity"]
+    assert p["models"] == ["layerskip-llama3-8B"] and p["datasets"] == ["cnn_dm_summarization", "gsm8k"]
+    assert p["lengths"] == [512] and p["batch_sizes"] == [4, 16]
+    base, _ = engine_config("all", args)
+    assert (base.sched, base.exit, base.prefill) == ("m1", "m2", "m3")
+    seen = {k: set() for k in SENSITIVITY}
+    for c in p["configs"]:
+        if "@" not in c:
+            continue
+        cfg, _ = engine_config(c, args)
+        diff = {f.name for f in dataclasses.fields(cfg) if getattr(cfg, f.name) != getattr(base, f.name)}
+        assert len(diff) == 1, (c, diff)
+        (key,) = diff
+        seen[key].add(getattr(cfg, key))
+    for k, vals in SENSITIVITY.items():
+        assert seen[k] | {SENS_DEFAULTS[k]} == set(vals) | {SENS_DEFAULTS[k]}
+    with pytest.raises(ValueError):
+        engine_config("all@temperature=1", args)

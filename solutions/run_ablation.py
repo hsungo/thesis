@@ -7,6 +7,7 @@
     python -m solutions.run_ablation --preset prefill-share       # prefill time share (upper bound for M3)
     python -m solutions.run_ablation --preset phase3              # + M3
     python -m solutions.run_ablation --preset full                # complete ablation (3 models x 4 tasks x 3 lengths x B x configs x 3 reps)
+    python -m solutions.run_ablation --preset sensitivity         # one parameter at a time (all@param=value)
     python -m solutions.run_ablation --preset poisson             # dynamic mode: Poisson arrivals
     python -m solutions.run_ablation --summarize --out results/eesd/ablation   # CSV + tables only (no GPU)
     ... --dry-run                                                 # list the runs, no GPU
@@ -25,6 +26,8 @@ Configurations (``--configs``):
     m2                       +M2 (fixed gamma = --base-gamma)
     m3                       +M3 (fixed gamma = --base-gamma)
     m1+m2  m1+m3  m2+m3  all
+    <config>@param=value     any of the above with an engine parameter overridden (sla_steps, d_max, omega,
+                             alpha0, probe_every, switch_margin, max_wait, knee_safety, gamma, k)
 Metrics (per run JSON and CSV): decode-only throughput (ASPIRE protocol, prefill excluded), end-to-end GPU
 throughput (prefill included), wall-clock throughput (perf_counter, host work included) and host_overhead_share;
 speedup vs AR for all three (same model / task / length / B / repetition), deep steps per
@@ -52,6 +55,14 @@ BASE = ["ar", "fixed-g2", "fixed-g3", "fixed-g4", "fixed-g6", "fixed-g8", "aspir
 MECH = ["m1", "m2", "m3", "m1+m2", "m1+m3", "m2+m3", "all", "m1-linear"]
 COMPARE = ["fsm-sync", "aspire-fsm", "m1-oracle"]      # comparison schedulers + oracle diagnostic
 
+# one-at-a-time sensitivity: every value differs from the default of that parameter; base config = "all"
+SENSITIVITY = {"sla_steps": [8, 16, 32, 64], "d_max": [8, 16], "omega": [0.6, 0.8, 0.9], "alpha0": [0.7, 0.9],
+               "probe_every": [10, 20, 50], "switch_margin": [0.02, 0.05, 0.1], "max_wait": [1, 3, 5],
+               "knee_safety": [0.8, 0.9, 1.0]}
+SENS_DEFAULTS = {"sla_steps": 32, "d_max": 16, "omega": 0.8, "alpha0": 0.9, "probe_every": 20, "switch_margin": 0.05,
+                 "max_wait": 3, "knee_safety": 0.9}
+SENS_CONFIGS = ["ar", "all"] + [f"all@{p}={v}" for p, vals in SENSITIVITY.items() for v in vals if v != SENS_DEFAULTS[p]]
+
 PRESETS = {
     "smoke": dict(models=["layerskip-llama3-1B"], datasets=["gsm8k"], lengths=[256], batch_sizes=[4],
                   configs=["ar", "fixed-g4", "aspire", "m1", "m2", "m3", "all"], reps=1, max_eval=32),
@@ -70,6 +81,8 @@ PRESETS = {
                    batch_sizes=[1, 4, 8, 16, 32], configs=["ar", "fixed-g4", "m1", "m3", "m1+m3"], reps=1),
     "full": dict(models=list(MODELS), datasets=list(DATASETS), lengths=[256, 512, 1024], batch_sizes=[1, 4, 8, 16, 32],
                  configs=BASE + MECH + COMPARE, reps=3),
+    "sensitivity": dict(models=["layerskip-llama3-8B"], datasets=["cnn_dm_summarization", "gsm8k"], lengths=[512],
+                        batch_sizes=[4, 16], configs=SENS_CONFIGS, reps=3),
     "poisson": dict(models=["layerskip-llama3-8B"], datasets=["cnn_dm_summarization", "gsm8k"], lengths=[512],
                     batch_sizes=[32], configs=["ar", "fixed-g4", "aspire", "m1", "m3", "all"], reps=3,
                     poisson_loads=[0.5, 0.8, 1.0]),
@@ -78,7 +91,25 @@ PRESETS = {
 
 # ------------------------------------------------------------------------------ configs
 
+OVERRIDABLE = {"sla_steps": int, "d_max": int, "omega": float, "alpha0": float, "probe_every": int,
+               "switch_margin": float, "max_wait": int, "knee_safety": float, "gamma": int, "k": int}
+
+
 def engine_config(name: str, args):
+    """Config name -> (EngineConfig, cost model kind).  ``<name>@param=value[@param=value]`` overrides
+    engine parameters (sensitivity preset)."""
+    import dataclasses
+    name, *overrides = name.split("@")
+    cfg, cost = _engine_config(name, args)
+    for o in overrides:
+        key, val = o.split("=")
+        if key not in OVERRIDABLE:
+            raise ValueError(f"cannot override {key!r}; allowed: {sorted(OVERRIDABLE)}")
+        cfg = dataclasses.replace(cfg, **{key: OVERRIDABLE[key](val)})
+    return cfg, cost
+
+
+def _engine_config(name: str, args):
     from solutions.engine import EngineConfig
     base = dict(k=args.k, d_max=args.d_max, sla_steps=args.sla_steps, probe_every=args.probe_every,
                 k_cands=tuple(args.k_cands), switch_margin=args.switch_margin, max_wait=args.max_wait,

@@ -76,6 +76,23 @@ CPU 測試在 `tests/test_eesd.py`（`python -m pytest`，不需要 GPU），涵
 | `aspire-fsm` | ASPIRE 的 FeedbackPolicy：每個 request 各自的目標長度（起始 3），全部接受 +1、否則 −1，各自觸發驗證 |
 | `m1-oracle` | 診斷用：決策規則和 M1 相同，但 E_i(d) 換成真實的確認 token 數 min(run_i, d) + 1。run_i 來自事先存好的 AR 參考輸出（`make_ref.py`，同一批 prompt），因此不需要額外的 GPU 同步。bf16 下輸出偏離參考時，該 request 改用 α 估計，比例記在 `oracle_coverage`。找不到參考輸出時直接報錯並印出產生指令。只能搭配固定 exit |
 
+## 敏感度分析（`--preset sensitivity`）
+LayerSkip Llama3-8B，cnn_dm_summarization 與 gsm8k，L = 512，B ∈ {4, 16}，每組 3 次。以 `all`（M1+M2+M3）為基準，
+一次只改一個參數（config 名稱寫成 `all@參數=值`，其餘維持預設；等於預設值的就是 `all` 本身）：
+
+| 參數 | 值（粗體為預設） |
+|---|---|
+| sla_steps | 8, 16, **32**, 64 |
+| d_max | 8, **16** |
+| ω | 0.6, **0.8**, 0.9 |
+| α₀ | 0.7, **0.9** |
+| probe_every | 10, **20**, 50 |
+| switch_margin | 0.02, **0.05**, 0.1 |
+| max_wait | 1, **3**, 5 |
+| knee_safety | 0.8, **0.9**, 1.0 |
+
+`@參數=值` 也能加在其他任何 config 後面（可覆寫的參數見 `run_ablation.py` 的 `OVERRIDABLE`）。
+
 已知限制（會影響量測，請在論文中寫明）：
 - 沒有 FlashInfer / flash-attn，attention 用 SDPA。
 - 驗證列不連續時要 gather KV（動機實驗 observation B1 量到 +10～31%；observation/ 另外存放）。
