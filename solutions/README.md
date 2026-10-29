@@ -106,7 +106,7 @@ LayerSkip Llama3-8B，cnn_dm_summarization 與 gsm8k，L = 512，B ∈ {4, 16}�
 - cyclic 量測一開始填滿 batch 時，一律用 separate prefill（此時還沒有可以搭載的 step）。
 
 ## 輸出
-執行指令見 repo 根目錄 README 的「EESD 實驗」一節。輸出在 `results/eesd/<preset>/`：
+執行順序（含必須停下來回報的檢查點）見 repo 根目錄 README 的「EESD 實驗」一節。輸出在 `results/eesd/<preset>/`：
 
 | 檔案 | 內容 |
 |---|---|

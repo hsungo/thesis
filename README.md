@@ -64,38 +64,28 @@ KV cache 是連續配置（B × (最長 prompt + max_new)）。`scripts/check_en
 
 ## EESD 實驗（solutions/，全部為實機量測）
 
-先在 CPU 跑測試（不需要 GPU）：`python -m pytest`。以下每一步都會用到 GPU，請依序執行；全部都可以續跑。
-長時間的工作建議用 `systemd-run --user --unit=<名字> --collect --working-directory=$PWD <指令>` 或 tmux 啟動，
-避免登出時被中斷。
+以下依序執行。每個 GPU 步驟都可以續跑（已存在的結果會跳過）；任何 `run_ablation` 指令加上 `--dry-run` 只列出要跑的組合，不用 GPU。
+長時間的工作建議包在 `systemd-run --user --unit=<名字> --collect --working-directory=$PWD <指令>` 或 tmux 裡，避免登出時被中斷。
 
 ```bash
 source .venv/bin/activate
 export PYTORCH_CUDA_ALLOC_CONF=expandable_segments:True TOKENIZERS_PARALLELISM=false
-
-# 0. 校準成本模型（每台 GPU、每個模型一次），並回報預測誤差 MAPE
-for m in layerskip-llama3-8B layerskip-llama3-1B layerskip-llama2-7B; do
-  python -m solutions.calibrate --model $m --validate
-done
-
-# 1. 無損檢查：fp32 的 1B 必須 100% 一致；bf16 的 8B 回報一致率（含 AR 自身在不同 B 下的一致率作為下限）
-python -m solutions.check_lossless --model layerskip-llama3-1B --dtype fp32
-python -m solutions.check_lossless --model layerskip-llama3-8B --dtype bf16
-
-# 2. 階段 0–3（每階段一個短 benchmark；--dry-run 可先列出要跑的組合）
-python -m solutions.run_ablation --preset smoke          # 幾分鐘，確認流程
-python -m solutions.run_ablation --preset phase0         # AR / fixed γ / aspire（重現舊數據）
-python -m solutions.run_ablation --preset phase1         # + M1、M1 + linear 成本模型
-python -m solutions.run_ablation --preset ksweep         # fixed k = 2..8（M2 的收益上限）
-python -m solutions.run_ablation --preset phase2         # + M2
-python -m solutions.run_ablation --preset prefill-share  # prefill 時間占比（M3 的收益上限）
-python -m solutions.run_ablation --preset phase3         # + M3
-
-# 3. 完整消融：3 模型 × 4 任務 × prompt 256/512/1024 × B∈{1,4,8,16,32} × 15 組合 × 3 次（8100 次執行，需數天）
-python -m solutions.run_ablation --preset full
-python -m solutions.run_ablation --preset poisson        # 動態模式（Poisson 到達）
-
-# 只重算 CSV 和表格（不用 GPU）
-python -m solutions.run_ablation --preset full --summarize
 ```
 
-輸出在 `results/eesd/`，說明見 `solutions/README.md`。
+| # | 步驟 | 指令 | 執行次數（dry-run） | 檢查點 |
+|---|---|---|---|---|
+| 1 | CPU 測試 | `python -m pytest` | — | 必須全部通過（含所有無損測試） |
+| 2 | 校準成本模型（F_eff、實測膝點）並回報 MAPE | `for m in layerskip-llama3-1B layerskip-llama2-7B layerskip-llama3-8B; do python -m solutions.calibrate --model $m --validate; done` | 3 個模型 | 看新舊兩版的 MAPE 與 n = 64..256 的誤差 |
+| 3 | 實機無損 | `python -m solutions.check_lossless --model layerskip-llama3-1B --dtype fp32`<br>`python -m solutions.check_lossless --model layerskip-llama3-8B --dtype bf16` | 各 25 種以上組合 | **fp32 1B 必須 100% 一致**，否則停止 |
+| 4 | phase0：baseline | `python -m solutions.run_ablation --preset phase0` | 140 | 應重現同步約 1.6–1.8×、aspire 約 0.6×；**不符合就停下來回報** |
+| 5 | ksweep、prefill-share | `python -m solutions.run_ablation --preset ksweep`<br>`python -m solutions.run_ablation --preset prefill-share` | 300 + 180 | **跑完先停，回報結果，由研究者決定 M2、M3 是否保留** |
+| 6 | m1-oracle 的參考輸出 | `python -m solutions.make_ref --model layerskip-llama3-8B --lengths 512` | 4 個任務 | phase1 的 m1-oracle 需要它（缺少時會報錯並印出這條指令） |
+| 7 | phase1–3（含 fsm-sync、aspire-fsm、m1-oracle 的比較） | `python -m solutions.run_ablation --preset phase1`<br>`python -m solutions.run_ablation --preset phase2`<br>`python -m solutions.run_ablation --preset phase3` | 160 + 100 + 100 | 回報三種吞吐量（decode / e2e GPU / 牆鐘），沒有收益也照實寫 |
+| 8 | 敏感度分析 | `python -m solutions.run_ablation --preset sensitivity` | 204 | 一次只改一個參數 |
+| 9 | 完整消融、動態到達 | `python -m solutions.make_ref --model <每個模型> --lengths 256 512 1024`（m1-oracle 用）<br>`python -m solutions.run_ablation --preset full`<br>`python -m solutions.run_ablation --preset poisson` | 9720 + 36 | full 需要數天；放不下的組合會記在 `skipped/` |
+
+其他：
+- 只重算 CSV 與表格（不用 GPU）：`python -m solutions.run_ablation --preset <preset> --summarize`
+- 快速確認流程：`python -m solutions.run_ablation --preset smoke`（7 次執行，1B 模型）
+
+輸出在 `results/eesd/`，各欄位說明見 `solutions/README.md`。
