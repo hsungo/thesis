@@ -1,7 +1,7 @@
 # 批次化 Early-Exit Self-Speculative Decoding（碩士論文研究程式碼）
 
 以非同步排程與 Verification Coalescing 提升 layer-skip 自我推測解碼的批次吞吐量。
-研究計畫見 `研究計畫_批次化EarlyExit自我推測解碼.pdf`；參考實作：
+研究計畫書（PDF）另外存放，不在此 repo；參考實作：
 [ASPIRE](https://github.com/Amir-zsh/ASPIRE)（評測協定、排程公式）、[DEL](https://github.com/hoenza/DEL)（LayerSkip 前向語意、prompt 格式）。
 
 ## 目錄
@@ -17,9 +17,8 @@ common/        共用核心（所有實驗與之後的 solutions 都用這一份
   memory.py      KV cache 記憶體規劃（4090 上哪些 batch size 放得下）
   methods.py     解碼方法註冊表（evaluation/benchmark.py 用）
   data.py        資料集與 prompt 格式；profiler.py / timing.py / cli.py / utils.py
-observation/   O1–O7 動機實驗（見 observation/README.md）
-  v2/            補充實驗（全部實機量測）：設定核對、兩段式 engine、邊際成本、roofline、實機 grid、到達模式
-  results/       各實驗的 SUMMARY / REPORT / CSV / 圖（原始 run JSON、trace、log 不進 git）
+observation/   動機實驗 O1–O7 與補充實驗 v2 的腳本和結果摘要（另外存放，不在此 repo；
+               tests/test_mixed_engine.py 在沒有 observation/ 時會自動 skip）
 solutions/     EESD engine：合併 shallow/deep 執行、M1 批次觸發、M2 動態退出層、M3 prefill 搭載、
                可攜式成本模型、校準、無損檢查、消融（見 solutions/README.md）
 evaluation/    benchmark（任意方法）、AR baseline、結果彙整、無損檢查（見 evaluation/README.md）
@@ -39,8 +38,7 @@ python scripts/check_env.py --smoke layerskip-llama3-1B   # GPU、SDPA kernel、
 python scripts/prefetch_data.py       # 先把所有資料集下載到 HF cache（可先設 HF_HOME 到大磁碟）
 python -m pytest -m slow              # 用真實 1B checkpoint 驗證（EESD_TEST_DEVICE=cuda 可在 GPU 上跑）
 
-# 1. 動機實驗（計畫階段 2–3）；最後一步產生 observation/results/<model>/REPORT.md 與 paper/（論文用表格、圖、數字）
-tmux new -s obs 'bash observation/run_all.sh'
+# 1. 動機實驗（O1–O7）的腳本在另外存放的 observation/ 資料夾（不在此 repo）
 # 2. Baselines
 tmux new -s eval 'K=<k*> bash evaluation/run_baselines.sh'
 ```

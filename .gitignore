@@ -1,0 +1,21 @@
+# model weights and environments
+models/
+.venv/
+venv/
+
+# raw experiment outputs (summaries such as SUMMARY.md / CSV / figures may be committed)
+**/runs/
+**/logs/
+*.npz
+*.log
+
+# python
+__pycache__/
+*.pyc
+.pytest_cache/
+*.egg-info/
+
+# stored separately (not part of this repo)
+observation/
+CLAUDE.md
+github/

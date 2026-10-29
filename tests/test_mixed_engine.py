@@ -9,7 +9,10 @@ import pytest
 
 from conftest import random_prompts
 
-sys.path.insert(0, str(Path(__file__).resolve().parents[1] / "observation/v2"))
+_V2 = Path(__file__).resolve().parents[1] / "observation" / "v2"
+if not (_V2 / "mixed_engine.py").exists():   # observation/ is stored separately, not in this repo
+    pytest.skip("observation/v2 is not in this checkout", allow_module_level=True)
+sys.path.insert(0, str(_V2))
 
 MAX_NEW = 40
 

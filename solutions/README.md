@@ -63,7 +63,7 @@ CPU 測試在 `tests/test_eesd.py`（`python -m pytest`，不需要 GPU），涵
 
 已知限制（會影響量測，請在論文中寫明）：
 - 沒有 FlashInfer / flash-attn，attention 用 SDPA。
-- 驗證列不連續時要 gather KV（observation B1：+10～31%）。
+- 驗證列不連續時要 gather KV（動機實驗 observation B1 量到 +10～31%；observation/ 另外存放）。
 - eager 模式，沒有 CUDA Graph。
 - cyclic 量測一開始填滿 batch 時，一律用 separate prefill（此時還沒有可以搭載的 step）。
 
