@@ -49,9 +49,11 @@ class Telemetry:
         rows = []
         for line in out.splitlines():
             try:
-                rows.append([float(x) for x in line.split(",")])
+                v = [float(x) for x in line.split(",")]
             except ValueError:
-                pass
+                continue
+            if len(v) == 4:                     # the line cut by terminate() is dropped
+                rows.append(v)
         if not rows:
             return {}
         a = np.array(rows)
