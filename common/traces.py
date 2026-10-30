@@ -20,6 +20,11 @@ Trace layout (one .npz per dataset run)
     (optional, ExitProbe(topk_layer=k))
     exit_topk_ids / exit_topk_logits  [S, topk_exit]   top logits of exit layer `topk_layer`, descending
     full_topk_ids                     [S, topk_full]   top tokens of the full model, descending
+    (optional, ExitProbe(topk_layers=[k1, k2, ...]))
+    topk_layers                                  [n_t]
+    exit_topk_ids / exit_topk_logits  [S, n_t, topk_exit]
+    exit_lse / exit_entropy           [S, n_t]   logsumexp and entropy (nats) of every listed exit's full softmax
+    full_topk_ids                     [S, topk_full]
     meta         json string
 
 Row t of a request corresponds to generated token y_t; y_0 comes from the prefill.
@@ -45,12 +50,14 @@ class ExitProbe:
     """Observer for `ARBatchEngine` that records every exit layer's prediction."""
 
     def __init__(self, model, exit_layers: list[int], temperature: float = 0.0, chunk_rows: int = 512,
-                 topk_layer: Optional[int] = None, topk_exit: int = 64, topk_full: int = 32):
+                 topk_layer: Optional[int] = None, topk_exit: int = 64, topk_full: int = 32,
+                 topk_layers: Optional[list] = None):
         self.model = model
         self.exit_layers = list(exit_layers)
         self.temperature = temperature
         self.chunk_rows = chunk_rows
         self.topk_layer, self.topk_exit, self.topk_full = topk_layer, topk_exit, topk_full
+        self.topk_layers = list(topk_layers) if topk_layers else None
         self.buffers: dict[int, dict[str, list]] = {}
         self.finished: list[dict] = []
 
@@ -79,6 +86,20 @@ class ExitProbe:
             ev, ei = self.model.head(hidden[self.topk_layer - 1]).float().topk(self.topk_exit, dim=-1)
             fi = full_logits.float().topk(self.topk_full, dim=-1).indices
             tk = (ei.int().cpu().numpy(), ev.cpu().numpy(), fi.int().cpu().numpy())
+        elif self.topk_layers is not None:
+            ids, vals, lse, ent = [], [], [], []
+            for k in self.topk_layers:
+                lg = self.model.head(hidden[k - 1]).float()                       # [B, V]
+                v, i = lg.topk(self.topk_exit, dim=-1)
+                z = torch.logsumexp(lg, dim=-1)
+                p = torch.softmax(lg, dim=-1)
+                ids.append(i)
+                vals.append(v)
+                lse.append(z)
+                ent.append(-(p * (lg - z[:, None])).sum(-1))
+            fi = full_logits.float().topk(self.topk_full, dim=-1).indices
+            tk = (torch.stack(ids, 1).int().cpu().numpy(), torch.stack(vals, 1).cpu().numpy(), fi.int().cpu().numpy(),
+                  torch.stack(lse, 1).cpu().numpy(), torch.stack(ent, 1).cpu().numpy())
         return am, pr, tk
 
     def on_prefill(self, slot, state, hidden, logits, token) -> None:
@@ -113,6 +134,9 @@ class ExitProbe:
             rec["exit_topk_ids"] = np.stack([t[0] for t in tk]).astype(np.int32)
             rec["exit_topk_logits"] = np.stack([t[1] for t in tk]).astype(np.float32)
             rec["full_topk_ids"] = np.stack([t[2] for t in tk]).astype(np.int32)
+            if len(tk[0]) > 3:
+                rec["exit_lse"] = np.stack([t[3] for t in tk]).astype(np.float32)
+                rec["exit_entropy"] = np.stack([t[4] for t in tk]).astype(np.float32)
         self.finished.append(rec)
 
     def save(self, path: str | Path, meta: dict, extra: Optional[dict] = None) -> Path:
@@ -128,9 +152,13 @@ class ExitProbe:
         if recs and "accept_prob" in recs[0]:
             arrays["accept_prob"] = np.concatenate([r["accept_prob"] for r in recs])
         if recs and "exit_topk_ids" in recs[0]:
-            for key in ("exit_topk_ids", "exit_topk_logits", "full_topk_ids"):
-                arrays[key] = np.concatenate([r[key] for r in recs])
-            arrays["topk_layer"] = np.asarray(self.topk_layer, dtype=np.int32)
+            for key in ("exit_topk_ids", "exit_topk_logits", "full_topk_ids", "exit_lse", "exit_entropy"):
+                if key in recs[0]:
+                    arrays[key] = np.concatenate([r[key] for r in recs])
+            if self.topk_layers is not None:
+                arrays["topk_layers"] = np.asarray(self.topk_layers, dtype=np.int32)
+            else:
+                arrays["topk_layer"] = np.asarray(self.topk_layer, dtype=np.int32)
         arrays.update(extra or {})
         meta = {**meta, "pids": [r["pid"] for r in recs], "finish_reasons": [r["finish_reason"] for r in recs]}
         arrays["meta"] = np.asarray(json.dumps(meta))

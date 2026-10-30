@@ -83,6 +83,11 @@ def main() -> None:
     ap.add_argument("--length-mode", choices=["exact", "cap", "auto"], default="exact",
                     help="auto = cap for human_eval (short prompts), exact otherwise")
     ap.add_argument("--topk-layer", type=int, default=None, help="also store the top-k of this exit layer and of the full model")
+    ap.add_argument("--topk-layers", nargs="+", type=int, default=None,
+                    help="store top-k ids/logits, logsumexp and entropy of these exit layers (+ full-model top-k)")
+    ap.add_argument("--stream-weights", action="store_true",
+                    help="keep weights in pinned host memory and stream layers to the GPU (model larger than VRAM; "
+                         "outputs only - observation/v3/streamed.py)")
     ap.add_argument("--topk-exit", type=int, default=64)
     ap.add_argument("--topk-full", type=int, default=32)
     ap.add_argument("--freq-prompts", type=int, default=0,
@@ -93,7 +98,13 @@ def main() -> None:
     args = ap.parse_args()
     seed_everything(args.seed)
     tok = load_tokenizer(resolve_model_path(args.model))
-    model = load_model_from_args(args, max_seq=max(args.lengths) + args.max_new_tokens + 64)
+    if args.stream_weights:
+        from common.utils import DTYPES
+        from observation.v3.streamed import StreamedLlama
+        model = StreamedLlama.load(resolve_model_path(args.model), dtype=DTYPES[args.dtype],
+                                   max_seq=max(args.lengths) + args.max_new_tokens + 64)
+    else:
+        model = load_model_from_args(args, max_seq=max(args.lengths) + args.max_new_tokens + 64)
     layers = [k for k in args.exit_layers if 1 <= k < model.n_layers] + [model.n_layers]
     for ds in args.datasets:
         mode = length_mode(args.length_mode, ds)
@@ -105,7 +116,8 @@ def main() -> None:
             eng = ARBatchEngine(model, min(args.batch_size, len(pool)), max(len(p.tokens) for p in pool),
                                 args.max_new_tokens, eos_ids(tok, model.cfg))
             eng.stop_checker = StopChecker(tok, STOP_STRINGS.get(ds, ()))
-            probe = ExitProbe(model, layers, topk_layer=args.topk_layer, topk_exit=args.topk_exit, topk_full=args.topk_full)
+            probe = ExitProbe(model, layers, topk_layer=args.topk_layer, topk_exit=args.topk_exit, topk_full=args.topk_full,
+                              topk_layers=args.topk_layers)
             eng.probe = probe
             eng.run(pool, RunConfig(mode="static"))
             out = ref_path(args.out, args.model, ds, L)

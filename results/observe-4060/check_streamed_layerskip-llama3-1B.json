@@ -1,0 +1,30 @@
+{
+  "model": "layerskip-llama3-1B",
+  "env": {
+    "python": "3.13.4",
+    "torch": "2.14.1+cu126",
+    "transformers": "5.22.0",
+    "platform": "Windows-11-10.0.26200-SP0",
+    "hostname": "LAPTOP-FRJLBIVU",
+    "device": "cuda",
+    "git_commit": "912ddbd003180a9b5ad5547360179616f391a34f-dirty",
+    "cuda_visible_devices": null,
+    "gpu": "NVIDIA GeForce RTX 4060 Laptop GPU",
+    "cuda": "12.6",
+    "gpu_mem_gb": 8.0
+  },
+  "datasets": {
+    "cnn_dm_summarization": {
+      "requests": 16,
+      "identical_requests": 16,
+      "tokens": 1821,
+      "agreeing_tokens": 1821
+    },
+    "gsm8k": {
+      "requests": 16,
+      "identical_requests": 16,
+      "tokens": 988,
+      "agreeing_tokens": 988
+    }
+  }
+}

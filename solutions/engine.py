@@ -38,6 +38,7 @@ import torch
 
 from common.timing import Interval
 from solutions.exit_select import ExitController
+from solutions.graphs import round_up
 from solutions.packed import Block, build_packed, packed_layers, upload
 from solutions.prefill import M3Planner, split_separate
 from solutions.schedulers import make_scheduler
@@ -68,8 +69,11 @@ class EngineConfig:
     m3_chunk_cap: Optional[int] = None   # tests: force small chunks
     m2_force: Optional[str] = None       # tests: "cycle"
     m3_force: bool = False               # tests: piggyback without the cost check
-    log_rounds: bool = False             # record every verification (drafts, accepted, committed); read back after
-                                         # the step's timing interval, so GPU step times are unchanged
+    log_rounds: bool = False             # record every step (token counts, drafters, verifications); host only
+    log_drafts: bool = False             # + the draft tokens of every verification (read back after the step's
+                                         # GPU timing interval: GPU step times unchanged, wall clock not)
+    graphs: bool = False                 # CUDA graphs for uniform steps (solutions/graphs.py); others run eagerly
+    segment_timing: bool = False         # CUDA events between the segments of every step (Rec.seg_ms)
 
     def label(self) -> str:
         if self.mode == "ar":
@@ -106,6 +110,9 @@ class Rec:
     n_chunk: int = 0
     plan_ms: float = 0.0
     k: int = 0
+    meta_ms: float = 0.0         # host time building the step's metadata before the GPU interval starts
+    graph: bool = False
+    marks: Optional[list] = None  # segment_timing: (segment name, end event) in order, from iv start
     _ms: Optional[float] = None
 
     @property
@@ -113,6 +120,14 @@ class Rec:
         if self._ms is None:
             self._ms = self.iv.ms
         return self._ms
+
+    def seg_ms(self) -> dict:
+        """GPU time of every segment (between consecutive marks, the first from the interval start)."""
+        out, prev = {}, (self.iv._e0 if self.iv.cuda else self.iv._t0)
+        for name, ev in self.marks or ():
+            out[name] = out.get(name, 0.0) + (prev.elapsed_time(ev) if self.iv.cuda else 1000 * (ev - prev))
+            prev = ev
+        return out
 
 
 class EESDEngine:
@@ -131,8 +146,9 @@ class EESDEngine:
             raise ValueError("exit layer must be in [1, n_layers)")
         Dm = cfg.d_max
         model.allocate_cache(B, max_prompt + max_new + Dm + 40)
-        self.seq_buf = torch.zeros(B, Dm + 1, dtype=torch.long, device=self.dev)
-        self.exit_h = torch.zeros(B, Dm + 1, model.cfg.dim, dtype=model.dtype, device=self.dev)
+        # row B is a scratch row (padded tokens of CUDA graphs write there); slots use rows 0..B-1
+        self.seq_buf = torch.zeros(B + 1, Dm + 1, dtype=torch.long, device=self.dev)
+        self.exit_h = torch.zeros(B + 1, Dm + 1, model.cfg.dim, dtype=model.dtype, device=self.dev)
         self.state = np.zeros(B, dtype=np.int64)
         self.pos = np.zeros(B, dtype=np.int64)
         self.d = np.zeros(B, dtype=np.int64)
@@ -159,13 +175,46 @@ class EESDEngine:
         self.kv_bytes_per_pos = 2 * model.cfg.n_kv_heads * model.cfg.head_dim * model.dtype.itemsize
         self.fallback_reasons: dict = {}
         self.n_assigned = 0
-        self.round_log: list = []    # cfg.log_rounds: one entry per deep step
+        self.round_log: list = []    # cfg.log_rounds: one entry per step
+        self.marks: Optional[list] = None
+        self._last_L = (0, 0)        # attention length (largest bucket L) of the last step's segments
+        self.gr = None
+        if cfg.graphs:
+            if self.dev.type != "cuda":
+                raise ValueError("graphs need a CUDA device")
+            from solutions.graphs import GraphRunner
+            self.gr = GraphRunner(model, B, self.seq_buf, self.exit_h, Dm)
+            self.gr.init_buffers(range(1, Dm + 2))
+            mx = max_prompt + max_new + Dm + 1
+            if cfg.mode == "ar":
+                self.gr.precapture([(0, self.L, "seq", False)], None, (), mx)
+            else:
+                Ts = range(2, cfg.gamma + 2) if cfg.sched == "fixed" else range(2, Dm + 2)
+                self.gr.precapture([(0, self.k, "seq", True)], (self.k, self.L), Ts, mx)
 
     # ------------------------------------------------------------------ helpers
     def _rec(self, kind, iv, **kw) -> Rec:
-        r = Rec(kind, iv, self.measuring, k=self.k, **kw)
+        r = Rec(kind, iv, self.measuring, k=self.k, marks=self.marks, **kw)
+        self.marks = None
         self.records.append(r)
         return r
+
+    def _mark(self, name: str) -> None:
+        if self.marks is not None:
+            if self.dev.type == "cuda":
+                e = torch.cuda.Event(enable_timing=True)
+                e.record()
+            else:
+                e = time.perf_counter()
+            self.marks.append((name, e))
+
+    def _start_marks(self) -> None:
+        self.marks = [] if self.cfg.segment_timing else None
+
+    def _kv_graph(self, L: int, n_layers: int) -> None:
+        """KV accounting of a graph segment: every row reads L positions, rows are contiguous (no gather)."""
+        if self.measuring:
+            self.stats["kv_read_pos"] += self.B * L * n_layers
 
     def _commit(self, slot: int, toks) -> int:
         r = self.req[slot]
@@ -255,16 +304,48 @@ class EESDEngine:
         dec = np.flatnonzero(self.state == DECODE)
         if len(dec) == 0:
             return 0, []
-        pb = build_packed(m, [Block(int(i), int(self.pos[i]), 1) for i in dec], self.cfg.bucketing)
-        self._kv(pb, self.L)
-        slots = [b.row for b in pb.blocks]
-        iv = Interval(self.dev).start()
-        x = m.embed(self.seq_buf[upload(slots, self.dev), 0])
-        h = packed_layers(m, x, pb, 0, self.L)
-        y = m.head(h).argmax(-1)
-        self.seq_buf[upload(slots, self.dev), 0] = y
+        t0 = time.perf_counter()
+        if self.gr is not None:
+            gr, Dm1 = self.gr, self.cfg.d_max + 1
+            slots = [int(i) for i in dec]
+            idx = np.full(self.B, gr.S, dtype=np.int64)
+            pos = np.full(self.B, gr.scratch_pos, dtype=np.int64)
+            idx[dec] = dec * Dm1
+            pos[dec] = self.pos[dec]
+            Lb = round_up(int(self.pos[dec].max()) + 1)
+            self._kv_graph(Lb, self.L)
+            meta_ms = 1000 * (time.perf_counter() - t0)
+            self._start_marks()
+            iv = Interval(self.dev).start()
+            gr.set("seq_idx", idx)
+            gr.set("pos1", pos)
+            gr.set("drf_dst", idx)
+            self._mark("upload")
+            gr.layers(0, self.L, 1, Lb, "seq", False)
+            self._mark("layers")
+            gr.head_draft()
+            y = self.seq_buf[upload(slots, self.dev), 0]
+            self._mark("head")
+        else:
+            pb = build_packed(m, [Block(int(i), int(self.pos[i]), 1) for i in dec], self.cfg.bucketing)
+            self._kv(pb, self.L)
+            slots = [b.row for b in pb.blocks]
+            meta_ms = 1000 * (time.perf_counter() - t0)
+            self._start_marks()
+            iv = Interval(self.dev).start()
+            x = m.embed(self.seq_buf[upload(slots, self.dev), 0])
+            self._mark("upload")
+            h = packed_layers(m, x, pb, 0, self.L)
+            self._mark("layers")
+            y = m.head(h).argmax(-1)
+            self.seq_buf[upload(slots, self.dev), 0] = y
+            self._mark("head")
         iv.stop()
-        self._rec("ar", iv, n_sh=len(slots), n_dp=len(slots))
+        self._rec("ar", iv, n_sh=len(slots), n_dp=len(slots), meta_ms=meta_ms, graph=self.gr is not None)
+        if self.cfg.log_rounds:
+            self.round_log.append({"step": len(self.records) - 1, "measured": self.measuring, "kind": "ar",
+                                   "graph": self.gr is not None, "B_dec": len(slots), "n_sh": len(slots),
+                                   "n_dp": len(slots), "L_sh": int(Lb if self.gr is not None else max(bk.L for bk in pb.buckets))})
         y_h = y.tolist()
         committed, done = 0, []
         for s, t in zip(slots, y_h):
@@ -313,7 +394,109 @@ class EESDEngine:
                 n_sh += c
                 pend += c
         plan_ms = 1000 * (time.perf_counter() - t0)
+        use_graph = (self.gr is not None and not probe and not chunks and not flush
+                     and not any(self.pending[i] for i in range(self.B)))
+        if use_graph:
+            r = self._graph_gpu(dec, d, V, Dr, deep)
+            n_chunk_dp, pad = 0, r[-2:] if r is not None else (0, 0)
+        else:
+            r = self._eager_gpu(dec, d, V, Dr, deep, probe, chunks)
+            pad = (0, 0)
+        if r is None:
+            return 0, []
+        iv, N, n_v_tok, readback, vinfo, cinfo, meta_ms, n_chunk_dp = r[:8]
+        kind = "probe" if probe else ("deep" if deep else "shallow")
+        self._rec(kind, iv, n_sh=N, n_dp=n_v_tok, n_chunk=sum(c for (_, _, c) in chunks), plan_ms=plan_ms,
+                  meta_ms=meta_ms, graph=use_graph)
+        log = None
+        if cfg.log_rounds:
+            log = {"step": len(self.records) - 1, "measured": self.measuring, "kind": kind, "graph": use_graph,
+                   "B_dec": int(dec.sum()), "n_sh": int(N), "n_dp": int(n_v_tok + n_chunk_dp),
+                   "pad_sh": int(pad[0]), "pad_dp": int(pad[1]), "L_sh": int(self._last_L[0]), "L_dp": int(self._last_L[1]),
+                   "drafters": [[self.req[i].uid, int(d[i]) + 1] for i in np.flatnonzero(Dr)], "verifiers": []}
+            self.round_log.append(log)
+        return self._after_gpu(dec, d, V, Dr, deep, probe, chunks, plan_ms, readback, n_v_tok, vinfo, cinfo, log)
 
+    def _graph_gpu(self, dec, d, V, Dr, deep):
+        """GPU part of a uniform step with CUDA graphs (solutions/graphs.py): all B rows, padded."""
+        gr, B, Dm1, k, L = self.gr, self.B, self.cfg.d_max + 1, self.k, self.L
+        t0 = time.perf_counter()
+        decs = np.flatnonzero(dec)
+        if len(decs) == 0:
+            return None
+        sidx = np.full(B, gr.S, dtype=np.int64)
+        spos = np.full(B, gr.scratch_pos, dtype=np.int64)
+        sidx[decs] = decs * Dm1 + d[decs]
+        spos[decs] = self.pos[decs] + d[decs]
+        drf = np.flatnonzero(Dr)
+        ddst = np.full(B, gr.S, dtype=np.int64)
+        ddst[drf] = drf * Dm1 + d[drf] + 1
+        Ls = round_up(int(spos[decs].max()) + 1)
+        self._kv_graph(Ls, k)
+        self._last_L = (Ls, 0)
+        T = 0
+        if deep:
+            vs = np.flatnonzero(V)
+            Ti = d[vs] + 1
+            T = int(Ti.max())
+            n = B * T
+            vidx = np.full(n, gr.S, dtype=np.int64)
+            vpos = np.full(n, gr.scratch_pos, dtype=np.int64)
+            blk = np.full(n, B, dtype=np.int64)
+            dsrc = np.full(n, -1, dtype=np.int64)
+            col0 = np.full(B + 1, gr.S, dtype=np.int64)
+            yidx = []
+            for i, t in zip(vs, Ti):
+                o, rr = int(i) * T, np.arange(t)
+                vidx[o:o + t] = i * Dm1 + rr
+                vpos[o:o + t] = self.pos[i] + rr
+                blk[o:o + t] = i
+                dsrc[o:o + t - 1] = i * Dm1 + rr[:-1] + 1
+                col0[i] = i * Dm1
+                yidx.append(o + rr)
+            yidx = np.concatenate(yidx)
+            Ld = round_up(int(vpos[blk < B].max()) + 1)
+            self._kv_graph(Ld, L - k)
+            self._last_L = (Ls, Ld)
+            vstarts = np.concatenate([[0], np.cumsum(Ti)[:-1]]).astype(int).tolist()
+        meta_ms = 1000 * (time.perf_counter() - t0)
+        self._start_marks()
+        iv = Interval(self.dev).start()
+        gr.set("seq_idx", sidx)
+        gr.set("pos1", spos)
+        gr.set("exit_dst", sidx)
+        gr.set("drf_dst", ddst)
+        self._mark("upload")
+        gr.layers(0, k, 1, Ls, "seq", True)
+        self._mark("sh_layers")
+        gr.head_draft()
+        self._mark("sh_head")
+        readback, n_v_tok, vinfo = None, 0, None
+        if deep:
+            gr.set("exh_idx", vidx)
+            gr.set(f"pos{T}", vpos)
+            gr.set(f"blk{T}", blk)
+            gr.set(f"j{T}", np.tile(np.arange(T), B))
+            gr.set(f"dsrc{T}", dsrc)
+            gr.set(f"col0_{T}", col0)
+            self._mark("dp_meta")
+            gr.layers(k, L, T, Ld, "exh", False)
+            self._mark("dp_layers")
+            Yv = gr.head_verify(T)
+            self._mark("dp_head")
+            acc = gr.accept(T)
+            readback = torch.cat([acc[upload(vs, self.dev)], Yv[upload(yidx, self.dev)]]).cpu()
+            self._mark("accept")
+            n_v_tok = int(Ti.sum())
+            vinfo = ([int(i) for i in vs], vstarts, Ti.tolist())
+        iv.stop()
+        return iv, int(len(decs)), n_v_tok, readback, vinfo, [], meta_ms, 0, B, B * T
+
+    def _eager_gpu(self, dec, d, V, Dr, deep, probe, chunks):
+        """GPU part of a step on the packed path (solutions/packed.py)."""
+        m, cfg, k = self.m, self.cfg, self.k
+        Dm1 = cfg.d_max + 1
+        t0 = time.perf_counter()
         # ---- shallow segment blocks
         blocks, src_seq = [], {}
         for i in np.flatnonzero(dec):
@@ -325,9 +508,10 @@ class EESDEngine:
         for (i, p0, c) in chunks:
             blocks.append(Block(i, p0, c, ("chunk", i)))
         if not blocks:
-            return 0, []
+            return None
         pb = build_packed(m, blocks, cfg.bucketing)
         self._kv(pb, k)
+        self._last_L = (max(bk.L for bk in pb.buckets), 0)
         N = pb.n_tokens
         seq_idx = np.full(N, -1, dtype=np.int64)
         prompt_ids = np.zeros(N, dtype=np.int64)
@@ -350,25 +534,32 @@ class EESDEngine:
             else:
                 prompt_ids[s:s + b.T] = self.req[i].prompt[b.pos0:b.pos0 + b.T]
                 chunk_slices.append((i, b.pos0, b.T, s))
+        meta_ms = 1000 * (time.perf_counter() - t0)
+        self._start_marks()
         iv = Interval(self.dev).start()
         sidx = upload(seq_idx, self.dev)
         ids = torch.where(sidx >= 0, self.seq_buf.view(-1)[sidx.clamp(min=0)], upload(prompt_ids, self.dev))
+        self._mark("upload")
         cap_sh = {} if probe else None
         h = packed_layers(m, m.embed(ids), pb, 0, k, cap_sh, tuple(c for c in (self.exitc.cands if probe else ()) if c < k))
         exh = self.exit_h.view(-1, self.exit_h.shape[-1])
         exh[upload(exit_dst, self.dev)] = h[upload(exit_src, self.dev)]
+        self._mark("sh_layers")
         if drf_src:
             self.seq_buf.view(-1)[upload(drf_dst, self.dev)] = m.head(h[upload(drf_src, self.dev)]).argmax(-1)
+        self._mark("sh_head")
         for (i, p0, c, s) in chunk_slices:
             self.pending[i].append((p0, c, h[s:s + c]))
-        readback = None
-        n_v_tok = 0
+        readback, vinfo, cinfo = None, None, []
+        n_v_tok, n_chunk_dp = 0, 0
         if deep:
             n_chunk_dp = sum(c for i in range(self.B) for (_, c, _) in self.pending[i])
             readback, n_v_tok, vinfo, cinfo = self._deep(V, d, probe, h, pb, cap_sh)
         iv.stop()
-        kind = "probe" if probe else ("deep" if deep else "shallow")
-        self._rec(kind, iv, n_sh=N, n_dp=n_v_tok, n_chunk=sum(c for (_, _, c) in chunks), plan_ms=plan_ms)
+        return iv, N, n_v_tok, readback, vinfo, cinfo, meta_ms, n_chunk_dp
+
+    def _after_gpu(self, dec, d, V, Dr, deep, probe, chunks, plan_ms, readback, n_v_tok, vinfo, cinfo, log):
+        cfg = self.cfg
         # ---- host bookkeeping (no GPU access until here; a deep step synchronises once in .cpu())
         self.d[Dr] += 1
         if self.measuring:
@@ -386,20 +577,18 @@ class EESDEngine:
         acc = np.array(rb[:nv], dtype=np.int64)
         Y = rb[nv:nv + n_v_tok]
         accepted = np.zeros(self.B, dtype=np.int64)
-        log = None
-        if cfg.log_rounds:      # drafts are still in seq_buf[:, 1:] (the deep step only rewrote column 0)
-            drafts = self.seq_buf[upload(vslots, self.dev)].tolist() if nv else []
-            log = {"step": len(self.records) - 1, "measured": self.measuring, "kind": kind, "B_dec": int(dec.sum()),
-                   "n_sh": int(N), "n_dp": int(n_v_tok + n_chunk_dp), "verifiers": []}
-            self.round_log.append(log)
+        drafts = None
+        if log is not None and cfg.log_drafts and nv:   # drafts are still in seq_buf[:, 1:] (only column 0 changed)
+            drafts = self.seq_buf[upload(vslots, self.dev)].tolist()
         for j, i in enumerate(vslots):
             a = int(acc[j])
             accepted[i] = a
             toks = Y[vstarts[j]:vstarts[j] + a + 1]
             n_out = len(self.req[i].out)
             if log is not None:
-                log["verifiers"].append({"uid": self.req[i].uid, "pos": int(self.pos[i]), "d": int(d[i]), "a": a,
-                                         "drafts": drafts[j][1:int(d[i]) + 1]})
+                log["verifiers"].append({"uid": self.req[i].uid, "pos": int(self.pos[i]), "d": int(d[i]), "a": a})
+                if drafts is not None:
+                    log["verifiers"][-1]["drafts"] = drafts[j][1:int(d[i]) + 1]
             self.pos[i] += a + 1
             self.d[i] = 0
             committed += self._commit(i, toks)
@@ -448,6 +637,7 @@ class EESDEngine:
                 blocks.append(Block(i, p0, c, ("cd", i, hk)))
         pb = build_packed(m, blocks, cfg.bucketing)
         self._kv(pb, L - k)
+        self._last_L = (self._last_L[0], max(bk.L for bk in pb.buckets))
         pieces, exit_rows = [], []
         vslots, vstarts, vT, vtok_packed = [], [], [], []
         cfin, cfin_idx = [], []
@@ -475,14 +665,17 @@ class EESDEngine:
         exh = self.exit_h.view(-1, self.exit_h.shape[-1])
         xs = [exh[upload(p[1], self.dev)] if p[0] == "exit" else p[1] for p in pieces]
         x = torch.cat(xs) if len(xs) > 1 else xs[0]
+        self._mark("dp_meta")
         cands = self.exitc.cands if probe else ()
         cap_dp = {} if probe else None
         hd = packed_layers(m, x, pb, k, L, cap_dp, tuple(c for c in cands if c > k))
+        self._mark("dp_layers")
         out = []
         nvt = len(vtok_packed)
         if nvt:
             vt = upload(vtok_packed, self.dev)
             Yv = m.head(hd[vt]).argmax(-1)
+            self._mark("dp_head")
             dsrc_t = upload(dsrc, self.dev)
             dr = torch.where(dsrc_t >= 0, self.seq_buf.view(-1)[dsrc_t.clamp(min=0)], torch.full_like(dsrc_t, -1))
             jt = upload(j_loc, self.dev)
@@ -508,6 +701,7 @@ class EESDEngine:
                 self.req[i].pf_dp = p0 + c
             self.pending[i] = []
         rb = torch.cat([o.to(torch.long).reshape(-1) for o in out]).cpu() if out else torch.zeros(0, dtype=torch.long)
+        self._mark("accept")
         return rb, nvt, (vslots, vstarts, vT), cfin
 
     def _probe_counts(self, V, d, vslots, vT, vtok_packed, Yv, acc, x_k, hd, cap_dp, h_sh, pb_sh, cap_sh, bt, jt):
@@ -776,7 +970,30 @@ class EESDEngine:
             "evaluated_completions": sum(1 for c in completions if c["measured"]),
             "steps": st["steps"], "deep_steps": st["deep_steps"],
         }
+        meas_recs = [r for r in recs if r.measured]
+        metrics["graph_step_share"] = (sum(r.graph for r in meas_recs if r.kind != "prefill")
+                                       / max(sum(r.kind != "prefill" for r in meas_recs), 1))
+        metrics["graphs_captured"] = self.gr.n_captured if self.gr is not None else 0
+        metrics["meta_host_ms"] = float(sum(r.meta_ms for r in meas_recs))
+        metrics["plan_host_ms"] = float(sum(r.plan_ms for r in meas_recs))
+        kind_ms = {}
+        for r in meas_recs:
+            kind_ms[r.kind] = kind_ms.get(r.kind, 0.0) + r.ms
+        metrics["kind_ms"] = kind_ms
+        metrics["kind_steps"] = {kd: sum(r.kind == kd for r in meas_recs) for kd in kind_ms}
+        if self.cfg.segment_timing:              # GPU ms per (step kind, segment) over the measured window
+            seg = {}
+            for r in meas_recs:
+                for n, v in r.seg_ms().items():
+                    seg[f"{r.kind}:{n}"] = seg.get(f"{r.kind}:{n}", 0.0) + v
+            metrics["segment_ms"] = seg
         res = {"metrics": metrics, "engine_config": asdict(self.cfg), "completions": completions}
         if self.cfg.log_rounds:
+            for e in self.round_log:
+                rr = recs[e["step"]]
+                e["ms"] = rr.ms
+                e["meta_ms"] = rr.meta_ms
+                if rr.marks:
+                    e["seg_ms"] = rr.seg_ms()
             res["round_log"] = self.round_log
         return res

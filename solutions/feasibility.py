@@ -357,7 +357,7 @@ def cmd_rounds(args) -> None:
                     if f.exists():
                         continue
                     cfg, _ = engine_config(cname, engine_args(args.k))
-                    cfg = dataclasses.replace(cfg, log_rounds=True)
+                    cfg = dataclasses.replace(cfg, log_rounds=True, log_drafts=True)
                     t0 = time.time()
                     try:
                         eng = EESDEngine(model, B, max_p, args.max_new_tokens, eos, cfg, cm, stop_for=lambda pid: stop)
@@ -382,17 +382,23 @@ def cmd_rounds(args) -> None:
 
 # ============================================================================== sec.2 coverage (CPU)
 
-def load_ref(path: Path) -> tuple[list[dict], np.ndarray, dict]:
+def load_ref(path: Path, k: int = 3) -> tuple[list[dict], np.ndarray, dict]:
+    """Requests of a make_ref file with top-k data for exit layer k (single-layer or multi-layer format)."""
     z = np.load(path, allow_pickle=False)
     meta = json.loads(str(z["meta"]))
-    k = int(z["topk_layer"])
+    if "topk_layers" in z.files:
+        tl = z["topk_layers"].tolist().index(k)
+        tid, tlg = z["exit_topk_ids"][:, tl], z["exit_topk_logits"][:, tl]
+    else:
+        k = int(z["topk_layer"])
+        tid, tlg = z["exit_topk_ids"], z["exit_topk_logits"]
     col = z["exit_layers"].tolist().index(k)
     off, poff = z["offsets"], z["prompt_offsets"]
     reqs = []
     for r in range(len(off) - 1):
         a, b = int(off[r]), int(off[r + 1])
         reqs.append({"pid": meta["pids"][r], "prompt": z["prompt_tokens"][poff[r]:poff[r + 1]], "y": z["tokens"][a:b],
-                     "am": z["exit_argmax"][a:b, col], "tid": z["exit_topk_ids"][a:b], "tlg": z["exit_topk_logits"][a:b],
+                     "am": z["exit_argmax"][a:b, col], "tid": tid[a:b], "tlg": tlg[a:b],
                      "full": z["full_topk_ids"][a:b]})
     meta["k"] = k
     return reqs, z["heldout_freq"], meta
@@ -550,7 +556,7 @@ def rounds_by_request(run: dict) -> tuple[dict, dict, dict]:
     comp = {c["uid"]: c for c in run["completions"]}
     per = {}
     for si, st in enumerate(run["round_log"]):
-        for v in st["verifiers"]:
+        for v in st.get("verifiers", ()):
             if v["uid"] in comp:
                 per.setdefault(v["uid"], []).append((si, v))
     outs = {u: np.asarray(c["tokens"], dtype=np.int64) for u, c in comp.items()}
@@ -597,7 +603,7 @@ def extension_from_log(run: dict, Gs, exclude=frozenset()) -> dict:
                     extra = max(0, m - nv["a"])
                     tot["B_extra"] += extra
                     stepB[sj] += extra
-    meas = np.array([st["measured"] for st in run["round_log"]], dtype=bool)
+    meas = np.array([st["measured"] and st.get("kind", "deep") != "shallow" for st in run["round_log"]], dtype=bool)
     tot["deep_steps"] = int(meas.sum())
     tot["stepA"] = {G: float(stepA[G][meas].mean()) if meas.any() else 0.0 for G in Gs}
     tot["stepB"] = float(stepB[meas].mean()) if meas.any() else 0.0
@@ -675,7 +681,7 @@ def analyze_slack(out: Path, model: str, tasks, args) -> list[dict]:
                 if not f.exists():
                     continue
                 run = json.loads(f.read_text())
-                st = [s for s in run["round_log"] if s["measured"]]
+                st = [s for s in run["round_log"] if s["measured"] and s.get("kind", "deep") != "shallow"]
                 n = np.array([s["n_dp"] for s in st], dtype=float)
                 nv = np.array([max(len(s["verifiers"]), 1) for s in st], dtype=float)
                 slack = knee - n

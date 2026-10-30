@@ -16,6 +16,7 @@ __pycache__/
 *.egg-info/
 
 # stored separately (not part of this repo)
-observation/
+observation/*
+!observation/v3/
 CLAUDE.md
 github/

@@ -552,11 +552,12 @@ def test_kv_gather_share_is_reported(tiny_model, ar_ref):
 def test_round_log_matches_outputs(tiny_model, ar_ref, sched):
     """--log-rounds changes nothing and its rounds rebuild every output: first token + committed tokens."""
     prompts, ref = ar_ref
-    res = _engine(tiny_model, _cfg(sched=sched, log_rounds=True)).run(
+    res = _engine(tiny_model, _cfg(sched=sched, log_rounds=True, log_drafts=True, segment_timing=True)).run(
         prompts, "cyclic", warmup_samples=2, warmup_per_slot=0, min_eval=4, min_eval_per_slot=0, max_eval=10,
         keep_outputs=True)
     assert all(c["tokens"] == ref[c["pid"]] for c in res["completions"])
     stream = {}
+    assert set(res["metrics"]["segment_ms"]) >= {"shallow:sh_layers", "deep:dp_layers", "deep:accept"}
     for st in res["round_log"]:
         assert st["n_dp"] == sum(v["d"] + 1 for v in st["verifiers"])     # separate prefill: verify tokens only
         for v in st["verifiers"]:
@@ -612,7 +613,7 @@ def test_feasibility_log_analysis_aligns(tiny_model, ar_ref):
     from solutions.feasibility import extension_from_log, rounds_by_request
 
     prompts, _ = ar_ref
-    res = _engine(tiny_model, _cfg(sched="fixed", gamma=4, log_rounds=True)).run(
+    res = _engine(tiny_model, _cfg(sched="fixed", gamma=4, log_rounds=True, log_drafts=True)).run(
         prompts, "cyclic", warmup_samples=2, warmup_per_slot=0, min_eval=4, min_eval_per_slot=0, max_eval=10,
         keep_outputs=True)
     res["prompts"] = {p.pid: list(p.tokens) for p in prompts}
@@ -642,3 +643,43 @@ def test_feasibility_timing_harness_runs(tiny_model):
         deep_step(m, 2, 8, 2, 4, 3, buf, mk)
         assert len(mk.segments()[0]) == 6
     m.free_cache()
+
+
+# ------------------------------------------------------------------------------ CUDA graphs (GPU only)
+
+@pytest.fixture(scope="module")
+def tiny_cuda(tiny_dir):
+    if not torch.cuda.is_available():
+        pytest.skip("CUDA graphs need a GPU")
+    from common.model import LayerSkipLlama
+    return LayerSkipLlama.from_pretrained(tiny_dir, device="cuda", dtype=torch.float32, max_seq=512)
+
+
+@pytest.fixture(scope="module")
+def ar_ref_cuda(tiny_cuda):
+    prompts = random_prompts(7, seed=3)
+    res = _engine(tiny_cuda, _cfg(mode="ar"), B=1).run(prompts, "static", keep_outputs=True)
+    return prompts, _outputs(res)
+
+
+@pytest.mark.parametrize("sched,exit_,prefill", list(itertools.product(["fixed", "aspire", "m1"], ["fixed", "m2"],
+                                                                       ["separate", "m3"])))
+def test_graphs_are_lossless(tiny_cuda, ar_ref_cuda, sched, exit_, prefill):
+    """fp32: with CUDA graphs (probe / chunk steps fall back to eager) every combination equals AR."""
+    prompts, ref = ar_ref_cuda
+    cfg = _cfg(sched=sched, exit=exit_, prefill=prefill, graphs=True, segment_timing=True, log_rounds=True,
+               m2_force="cycle" if exit_ == "m2" else None)
+    res = _engine(tiny_cuda, cfg).run(prompts, "static", keep_outputs=True)
+    assert _outputs(res) == ref
+    if exit_ == "fixed" and prefill == "separate":
+        assert res["metrics"]["graph_step_share"] == 1.0
+
+
+def test_graphs_ar_and_cyclic(tiny_cuda, ar_ref_cuda):
+    prompts, ref = ar_ref_cuda
+    res = _engine(tiny_cuda, _cfg(mode="ar", graphs=True)).run(prompts, "static", keep_outputs=True)
+    assert _outputs(res) == ref
+    res = _engine(tiny_cuda, _cfg(sched="m1", graphs=True)).run(
+        prompts, "cyclic", warmup_samples=2, warmup_per_slot=0, min_eval=4, min_eval_per_slot=0, max_eval=10,
+        keep_outputs=True)
+    assert all(c["tokens"] == ref[c["pid"]] for c in res["completions"])

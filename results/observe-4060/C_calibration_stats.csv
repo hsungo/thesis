@@ -1,0 +1,5 @@
+model,task,k,ece_top1,corr_top1_accept,corr_entropy_accept,share_p1_ge_05,accept_p1_ge_05,accept_p1_lt_05
+layerskip-llama3-1B,cnn_dm_summarization,3,0.140316,0.622003,-0.582245,0.712621,0.973812,0.50077
+layerskip-llama3-1B,xsum_summarization,3,0.163011,0.604312,-0.574925,0.481493,0.946322,0.442462
+layerskip-llama3-1B,human_eval,3,0.0485552,0.62822,-0.582161,0.767623,0.925254,0.407407
+layerskip-llama3-1B,gsm8k,3,0.019727,0.693815,-0.63629,0.739808,0.905673,0.288479
