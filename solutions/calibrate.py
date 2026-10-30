@@ -169,7 +169,16 @@ def measure_knee(m, ns=N_GRID, ctx: int = 128) -> dict:
             rows.append({"n": n, "ms": _t(lambda: packed_layer(m, 1, x, pb), reps=20, warm=5)})
         m.free_cache()
     knee, beta = hinge_knee([r["n"] for r in rows], [r["ms"] for r in rows])
-    return {"knee_measured": knee, "knee_fit": {"a": beta[0], "b": beta[1]}, "layer_grid": rows}
+    return {"knee_measured": knee, "knee_fit": {"a": beta[0], "b": beta[1]}, "layer_grid": rows, "ctx": ctx}
+
+
+def layer_t_op(kn: dict, mic: dict, ops: dict, dims: ModelDims) -> float:
+    """t_op of the real layer: the measured layer time at small n (median over n <= 16, below the knee) minus
+    its weight and KV reads, divided by the layer's kernel count.  The empty-kernel loop misses the per-op
+    host work of a real eager layer (dispatch, metadata), which dominates on launch-bound GPUs/hosts."""
+    small = [r["ms"] for r in kn["layer_grid"] if r["n"] <= 16]
+    reads = (dims.layer_bytes + dims.kv_bytes_per_pos * kn["ctx"]) / mic["bw"]
+    return max(float(np.median(small)) - reads, 0.0) / ops["n_op_layer"]
 
 
 def fit_linear(rows, heads) -> dict:
@@ -255,14 +264,19 @@ def main() -> None:
     ops = trace_ops(model)
     fe = measure_flops_eff(model)
     kn = measure_knee(model)
+    t_op_layer = layer_t_op(kn, mic, ops, ModelDims.from_config(model.cfg))
+    t_op_micro = mic["t_op"]
+    mic["t_op"] = max(t_op_micro, t_op_layer)
     gpu = GPUParams(**mic, **ops, flops_eff=fe["flops_eff"], knee_measured=kn["knee_measured"],
                     meta={"host": socket.gethostname(), "env": env_info(model.device),
+                          "t_op_micro": t_op_micro, "t_op_layer": t_op_layer,
                           "flops_eff_at_n": fe["flops_eff_at_n"], "knee_fit": kn["knee_fit"],
                           "knee_analytic_peak": mic["flops"] * 2 / (2 * mic["bw"]),
                           "gemm_grid": fe["gemm_grid"], "knee_layer_grid": kn["layer_grid"]})
     res = {"model": name, "gpu": gpu, "model_dims": ModelDims.from_config(model.cfg).__dict__}
     print(f"[calibrate] F peak {mic['flops'] / 1e9:.1f} TFLOP/s, F_eff {fe['flops_eff'] / 1e9:.1f} TFLOP/s "
-          f"(n={fe['flops_eff_at_n']}); knee measured {kn['knee_measured']:.0f} tokens", flush=True)
+          f"(n={fe['flops_eff_at_n']}); knee measured {kn['knee_measured']:.0f} tokens; t_op {1e3 * mic['t_op']:.1f} us "
+          f"(empty-kernel loop {1e3 * t_op_micro:.1f} us, real layer {1e3 * t_op_layer:.1f} us)", flush=True)
     if not args.skip_linear:
         rows, heads = layer_grid(model)
         res["linear"] = {**fit_linear(rows, heads), "n_layers": model.n_layers, "model_name": name}
@@ -275,6 +289,7 @@ def main() -> None:
         if "linear" in res:
             lin = res["linear"]
             cms["linear"] = LinearCostModel(lin["a"], lin["b"], lin["c"], lin["head_a"], lin["head_b"], dims)
+        out.parent.mkdir(parents=True, exist_ok=True)
         res["validation"] = validate(model, cms, args.k, out.with_name(out.stem + "_validation.csv"))
         for kname, v in res["validation"].items():
             print(f"[calibrate] {kname:28s} n={v['n']:3d}  MAPE {100 * v['mape']:5.1f}%  max {100 * v['max_ape']:5.1f}%")

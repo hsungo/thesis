@@ -1,0 +1,247 @@
+<title>EESD RTX 4060 實測</title>
+<meta name="claude:viewport-fit-sides" content="cover">
+<link rel="preconnect" href="https://fonts.googleapis.com">
+<link rel="stylesheet" href="https://fonts.googleapis.com/css2?family=Noto+Sans+TC:wght@400;500;700&family=IBM+Plex+Mono:wght@400;500&display=swap">
+<style>
+/* Layout: one reading column for prose, tables allowed to scroll on their own. Lab-notebook feel: ink on cool paper, one steel-teal accent. */
+:root {
+  --bg: #f5f7f8; --surface: #ffffff; --ink: #18222b; --muted: #5a6873; --rule: #d7dee3;
+  --accent: #17677e; --accent-soft: #e3f0f3; --good: #1d7a4c; --good-soft: #e2f3ea; --bad: #a8402e; --bad-soft: #f7e6e2;
+  --sans: "Noto Sans TC", "PingFang TC", "Microsoft JhengHei", system-ui, sans-serif;
+  --mono: "IBM Plex Mono", ui-monospace, "Cascadia Mono", Consolas, monospace;
+}
+@media (prefers-color-scheme: dark) { :root:not([data-theme="light"]) {
+  --bg: #111820; --surface: #18222c; --ink: #e3e9ee; --muted: #9aa8b3; --rule: #2c3a46;
+  --accent: #6cc0d6; --accent-soft: #1b3440; --good: #6fcf9c; --good-soft: #17352a; --bad: #ef9a86; --bad-soft: #3e2420; color-scheme: dark } }
+:root[data-theme="dark"] {
+  --bg: #111820; --surface: #18222c; --ink: #e3e9ee; --muted: #9aa8b3; --rule: #2c3a46;
+  --accent: #6cc0d6; --accent-soft: #1b3440; --good: #6fcf9c; --good-soft: #17352a; --bad: #ef9a86; --bad-soft: #3e2420; color-scheme: dark }
+body { background: var(--bg); color: var(--ink); font-family: var(--sans); font-size: 15px; line-height: 1.7; }
+.wrap { max-width: 980px; margin: 0 auto; padding-block: 40px 64px;
+  padding-left: max(16px, env(safe-area-inset-left, 0px)); padding-right: max(16px, env(safe-area-inset-right, 0px));
+  display: grid; gap: 36px; }
+header { display: grid; gap: 8px; }
+.eyebrow { font-family: var(--mono); font-size: 12px; letter-spacing: .08em; text-transform: uppercase; color: var(--accent); }
+h1 { font-size: 28px; line-height: 1.3; margin: 0; text-wrap: balance; }
+h2 { font-size: 20px; margin: 0; padding-top: 4px; border-top: 2px solid var(--ink); text-wrap: balance; }
+h3 { font-size: 16px; margin: 0; }
+p, ul, ol { margin: 0; max-width: 68ch; }
+ul, ol { padding-left: 1.3em; display: grid; gap: 4px; }
+section { display: grid; gap: 14px; min-width: 0; }
+.meta { color: var(--muted); font-size: 13px; }
+.verdict { background: var(--surface); border: 1px solid var(--rule); border-left: 4px solid var(--accent); padding: 16px 20px; display: grid; gap: 10px; }
+.verdict li strong { color: var(--ink); }
+.tbl { overflow-x: auto; border: 1px solid var(--rule); background: var(--surface); }
+table { border-collapse: collapse; width: 100%; font-size: 13px; }
+th, td { padding: 6px 10px; text-align: right; white-space: nowrap; border-bottom: 1px solid var(--rule); }
+th { font-weight: 500; color: var(--muted); background: var(--bg); position: sticky; top: 0; }
+td:first-child, th:first-child { text-align: left; }
+td { font-family: var(--mono); font-variant-numeric: tabular-nums; }
+td.lbl { font-family: var(--sans); }
+tr.grp td { background: var(--bg); font-family: var(--sans); font-weight: 500; color: var(--muted); text-align: left; }
+.best { font-weight: 600; color: var(--good); background: var(--good-soft); }
+.worse { color: var(--bad); background: var(--bad-soft); }
+.ours { box-shadow: inset 3px 0 0 var(--accent); }
+.note { font-size: 13px; color: var(--muted); max-width: 80ch; }
+.pill { display: inline-block; font-size: 12px; padding: 1px 8px; border-radius: 999px; font-weight: 500; }
+.pill.ok { background: var(--good-soft); color: var(--good); }
+.pill.no { background: var(--bad-soft); color: var(--bad); }
+.pill.mid { background: var(--accent-soft); color: var(--accent); }
+code { font-family: var(--mono); font-size: .92em; background: var(--accent-soft); padding: 0 4px; border-radius: 3px; }
+.cols { display: grid; grid-template-columns: repeat(auto-fit, minmax(280px, 1fr)); gap: 16px; }
+.card { background: var(--surface); border: 1px solid var(--rule); padding: 14px 16px; display: grid; gap: 6px; min-width: 0; }
+</style>
+
+<div class="wrap">
+<header>
+  <div class="eyebrow">批次化 Early-Exit 自我推測解碼 · 實機量測報告</div>
+  <h1>RTX 4060 Laptop 上的 baseline 與三機制量測（兩輪 + 動態到達）</h1>
+  <p class="meta">2026-10-30 · LayerSkip Llama3.2-1B · bf16 greedy · 程式碼 hsungo/thesis @ 2cf951c + 本地修改（未 commit）</p>
+</header>
+
+<section class="verdict">
+  <h3>結論</h3>
+  <ul>
+    <li><strong>O3 兩輪都重現：</strong>ASPIRE 各自排程在 B ≥ 8 只有 0.58–0.59×（比 AR 慢），每 token 深層次數是 AR 的 1.07–1.60 倍；同步批次只要 0.29–0.46 倍。</li>
+    <li><strong>固定 batch 下沒有方法能在雜訊之外勝出。</strong>M1 單獨的幾何平均最高（1.318×，最好的固定 γ 是 1.301×），但兩個行為完全相同的設定（M3 單獨 vs γ=4）就差了 2.5%，所以 +1.3% 不能算贏。</li>
+    <li><strong>三機制全開比 M1 單獨差</strong>（1.226× vs 1.318×）。M2 在 B=1 頻繁換層、在大 B 只付 probe 成本；M3 和 M1 合用時會在不划算的時候搭載 prefill。</li>
+    <li><strong>動態到達下 M1 沒有贏過所有固定 γ</strong>（計畫書 6.5 的條件未達成）。它的實際表現是「不用調參、總是接近最好的 γ」：飽和吞吐量在最佳值的 1–7% 內，而最佳 γ 換資料集就變（cnn_dm γ=4、gsm8k γ=2）。</li>
+    <li><strong>這台機器是 kernel launch 受限、雜訊大</strong>（同一格兩輪相差中位數 6–10%，最大 42%），結果不能直接代表 4090 + 8B。</li>
+  </ul>
+</section>
+
+<section>
+  <h2>1 · 實驗設定</h2>
+  <div class="tbl"><table>
+    <tr><th>項目</th><th style="text-align:left">內容</th></tr>
+    <tr><td class="lbl">GPU / 主機</td><td class="lbl" style="text-align:left">RTX 4060 Laptop 8 GB（sm_89）、Ryzen 5 7535HS、Windows 11、PyTorch 2.14.1+cu126、eager 模式</td></tr>
+    <tr><td class="lbl">模型</td><td class="lbl" style="text-align:left">LayerSkip Llama3.2-1B（8B 權重 15 GiB 放不下），預設退出層 k = 3</td></tr>
+    <tr><td class="lbl">資料集</td><td class="lbl" style="text-align:left">cnn_dm、xsum、gsm8k，prompt 512；HumanEval 沒有 512 token 的 prompt，腳本自動略過</td></tr>
+    <tr><td class="lbl">batch / 協定</td><td class="lbl" style="text-align:left">B = 1, 4, 8, 16, 32；ASPIRE cyclic replay，max_new_tokens 256；每格 1 次（第二輪即第二次重複）</td></tr>
+    <tr><td class="lbl">指標</td><td class="lbl" style="text-align:left">牆鐘吞吐量相對同格 AR 的加速比（含 CPU 時間；README 規定比較方法以此為準）</td></tr>
+    <tr><td class="lbl">無損</td><td class="lbl" style="text-align:left">實機 fp32，24 種開關組合，兩輪改動前後都 100% 與 AR 一致</td></tr>
+  </table></div>
+</section>
+
+<section>
+  <h2>2 · 兩輪之間的改動</h2>
+  <div class="tbl"><table>
+    <tr><th>改動</th><th style="text-align:left">原因</th><th style="text-align:left">效果</th></tr>
+    <tr><td class="lbl">校準：t_op 改為 max(空 kernel 迴圈, 由實測單層時間反推)</td><td class="lbl" style="text-align:left">空 kernel 量不到真實層裡每個 op 的 dispatch 開銷</td><td class="lbl" style="text-align:left">成本模型 MAPE 31.0% → 16.9%；換 GPU 自動適應（第一輪就已採用）</td></tr>
+    <tr><td class="lbl">校準：先建輸出資料夾</td><td class="lbl" style="text-align:left"><code>--validate</code> 寫 CSV 時資料夾不存在而 crash</td><td class="lbl" style="text-align:left">bug 修正</td></tr>
+    <tr><td class="lbl">M3：搭載判斷改為整個 prompt 的成本比較；<code>max_wait</code> 3 → 8（只當 TTFT 上限）</td><td class="lbl" style="text-align:left">舊規則只比一塊，忽略 slot 空等；只放寬 max_wait 時實測 e2e −30%、TTFT 46 → 420–590 ms</td><td class="lbl" style="text-align:left">M3 單獨時正確判斷「不划算」，不再損失</td></tr>
+    <tr><td class="lbl">動態到達：所有方法共用同一到達率；平均輸出長度改用每個 prompt 跑一次；新增從到達算起的 TTFT</td><td class="lbl" style="text-align:left">原本每個方法用自己的速率；且短請求偏差讓速率高估約 2 倍，所有負載都飽和</td><td class="lbl" style="text-align:left">負載 0.5 / 0.8 真的不排隊、B 會變動；第一次的動態到達結果作廢</td></tr>
+  </table></div>
+  <p class="note">檔案：solutions/calibrate.py、prefill.py、engine.py、run_ablation.py、README.md、tests/test_eesd.py（新增 <code>m3_force</code> 讓 CPU 測試繼續覆蓋搭載路徑）。87 個 CPU 測試通過。</p>
+</section>
+
+<section>
+  <h2>3 · 第一輪（改動前）</h2>
+  <div class="tbl"><table>
+    <tr><th>資料集 · B</th><th>同步 γ=4</th><th>同步最佳 γ（事後挑）</th><th>ASPIRE</th><th class="ours">三機制全開</th></tr>
+    <tr class="grp"><td colspan="5">cnn_dm</td></tr>
+    <tr><td>1</td><td>2.29</td><td>2.29 (γ4)</td><td>1.63</td><td class="ours worse">1.61</td></tr>
+    <tr><td>4</td><td>1.62</td><td>1.62 (γ3)</td><td>1.12</td><td class="ours">1.44</td></tr>
+    <tr><td>8</td><td>1.56</td><td>1.61 (γ3)</td><td class="worse">0.55</td><td class="ours worse">1.13</td></tr>
+    <tr><td>16</td><td>1.39</td><td>1.39 (γ4)</td><td class="worse">0.52</td><td class="ours best">1.41</td></tr>
+    <tr><td>32</td><td>1.27</td><td>1.31 (γ3)</td><td class="worse">0.49</td><td class="ours">1.28</td></tr>
+    <tr class="grp"><td colspan="5">xsum</td></tr>
+    <tr><td>1</td><td>1.27</td><td>1.33 (γ2)</td><td>1.34</td><td class="ours">1.21</td></tr>
+    <tr><td>4</td><td>1.08</td><td>1.18 (γ2)</td><td class="worse">0.67</td><td class="ours">1.07</td></tr>
+    <tr><td>8</td><td>1.01</td><td>1.21 (γ3)</td><td class="worse">0.77</td><td class="ours best">1.76</td></tr>
+    <tr><td>16</td><td>1.00</td><td>1.13 (γ6)</td><td class="worse">0.53</td><td class="ours">0.95</td></tr>
+    <tr><td>32</td><td>1.27</td><td>1.27 (γ4)</td><td class="worse">0.66</td><td class="ours">1.16</td></tr>
+    <tr class="grp"><td colspan="5">gsm8k</td></tr>
+    <tr><td>1</td><td>1.26</td><td>1.37 (γ3)</td><td>1.37</td><td class="ours">1.22</td></tr>
+    <tr><td>4</td><td>1.04</td><td>1.38 (γ3)</td><td class="worse">0.71</td><td class="ours">1.19</td></tr>
+    <tr><td>8</td><td>1.21</td><td>1.25 (γ6)</td><td class="worse">0.60</td><td class="ours">1.09</td></tr>
+    <tr><td>16</td><td>1.26</td><td>1.26 (γ4)</td><td class="worse">0.59</td><td class="ours">1.20</td></tr>
+    <tr><td>32</td><td>1.23</td><td>1.30 (γ2)</td><td class="worse">0.57</td><td class="ours">1.18</td></tr>
+  </table></div>
+  <p class="note">牆鐘加速比相對 AR。綠色：贏過該格最佳 γ；紅色：比 AR 慢或比最佳 γ 差 25% 以上。xsum B=8 的 1.76 與 cnn_dm B=8 的 1.13 在第二輪分別變成 1.06 與 1.55，屬於雜訊。</p>
+</section>
+
+<section>
+  <h2>4 · 第二輪（改動後，並單獨量 M1、M3）</h2>
+  <div class="tbl"><table>
+    <tr><th>資料集 · B</th><th>γ=2</th><th>γ=3</th><th>γ=4</th><th>γ=6</th><th>γ=8</th><th>ASPIRE</th><th class="ours">M1</th><th>M3*</th><th class="ours">三機制全開</th></tr>
+    <tr class="grp"><td colspan="10">cnn_dm</td></tr>
+    <tr><td>1</td><td>1.55</td><td>1.64</td><td>1.27</td><td>1.43</td><td>1.36</td><td class="best">1.67</td><td class="ours">1.59</td><td>1.63</td><td class="ours">1.52</td></tr>
+    <tr><td>4</td><td>1.59</td><td>1.72</td><td>1.72</td><td>1.64</td><td>1.61</td><td>1.00</td><td class="ours">1.78</td><td class="best">1.93</td><td class="ours">1.66</td></tr>
+    <tr><td>8</td><td>1.53</td><td>1.65</td><td class="best">1.66</td><td>1.43</td><td>1.29</td><td class="worse">0.66</td><td class="ours">1.54</td><td class="best">1.66</td><td class="ours">1.55</td></tr>
+    <tr><td>16</td><td>1.40</td><td>1.48</td><td class="best">1.49</td><td>1.27</td><td>1.04</td><td class="worse">0.50</td><td class="ours">1.33</td><td>1.41</td><td class="ours">1.22</td></tr>
+    <tr><td>32</td><td>1.25</td><td>1.24</td><td>1.30</td><td>1.23</td><td>1.14</td><td class="worse">0.49</td><td class="ours">1.33</td><td class="best">1.36</td><td class="ours">1.23</td></tr>
+    <tr class="grp"><td colspan="10">xsum</td></tr>
+    <tr><td>1</td><td>1.34</td><td>1.28</td><td>1.29</td><td>1.15</td><td>1.09</td><td class="best">1.46</td><td class="ours">1.30</td><td>1.43</td><td class="ours">1.42</td></tr>
+    <tr><td>4</td><td class="best">1.21</td><td>1.16</td><td>1.12</td><td>1.11</td><td>0.93</td><td class="worse">0.66</td><td class="ours">1.13</td><td>1.12</td><td class="ours">1.09</td></tr>
+    <tr><td>8</td><td class="best">1.16</td><td>1.07</td><td>1.06</td><td>0.92</td><td>0.93</td><td class="worse">0.59</td><td class="ours">1.06</td><td>1.00</td><td class="ours">1.06</td></tr>
+    <tr><td>16</td><td>1.07</td><td>1.09</td><td>1.05</td><td class="best">1.16</td><td>0.91</td><td class="worse">0.58</td><td class="ours">1.09</td><td>1.02</td><td class="ours">0.93</td></tr>
+    <tr><td>32</td><td>1.12</td><td>1.06</td><td class="best">1.23</td><td>0.98</td><td>1.01</td><td class="worse">0.63</td><td class="ours">1.08</td><td>1.18</td><td class="ours">1.04</td></tr>
+    <tr class="grp"><td colspan="10">gsm8k</td></tr>
+    <tr><td>1</td><td class="best">1.47</td><td>1.36</td><td>1.24</td><td>1.18</td><td>1.04</td><td>1.40</td><td class="ours">1.36</td><td>1.25</td><td class="ours">1.25</td></tr>
+    <tr><td>4</td><td>1.24</td><td>1.30</td><td>1.31</td><td>1.14</td><td>1.00</td><td>0.84</td><td class="ours best">1.34</td><td>1.23</td><td class="ours">1.32</td></tr>
+    <tr><td>8</td><td>1.25</td><td>1.24</td><td>1.25</td><td>1.04</td><td>1.07</td><td class="worse">0.73</td><td class="ours best">1.47</td><td>1.41</td><td class="ours">1.31</td></tr>
+    <tr><td>16</td><td>1.18</td><td>1.18</td><td>1.28</td><td>1.14</td><td>1.12</td><td class="worse">0.59</td><td class="ours best">1.32</td><td>1.25</td><td class="ours">1.10</td></tr>
+    <tr><td>32</td><td class="best">1.30</td><td>1.24</td><td>1.22</td><td>1.10</td><td>0.97</td><td class="worse">0.60</td><td class="ours">1.25</td><td>1.23</td><td class="ours">0.97</td></tr>
+  </table></div>
+  <p class="note">*M3 = 固定 γ=4 + M3。新規則在這組設定下從未搭載，行為與 γ=4 完全相同，可當作 γ=4 的第二次量測。綠色為該列最高。</p>
+
+  <h3>幾何平均（15 格，牆鐘加速比）</h3>
+  <div class="tbl"><table>
+    <tr><th>方法</th><th>第一輪 · 全部 B</th><th>第一輪 · B ≥ 8</th><th>第二輪 · 全部 B</th><th>第二輪 · B ≥ 8</th></tr>
+    <tr><td class="lbl">同步 γ=2</td><td>1.273</td><td>1.236</td><td>1.301</td><td>1.244</td></tr>
+    <tr><td class="lbl">同步 γ=3</td><td class="best">1.308</td><td class="best">1.250</td><td>1.297</td><td>1.236</td></tr>
+    <tr><td class="lbl">同步 γ=4</td><td>1.288</td><td>1.234</td><td>1.287</td><td class="best">1.271</td></tr>
+    <tr><td class="lbl">同步 γ=6</td><td>1.198</td><td>1.169</td><td>1.183</td><td>1.132</td></tr>
+    <tr><td class="lbl">同步 γ=8</td><td>1.066</td><td>1.036</td><td>1.088</td><td>1.047</td></tr>
+    <tr><td class="lbl">ASPIRE</td><td class="worse">0.747</td><td class="worse">0.583</td><td class="worse">0.762</td><td class="worse">0.592</td></tr>
+    <tr class="ours"><td class="lbl">M1</td><td>—</td><td>—</td><td class="best">1.318</td><td>1.264</td></tr>
+    <tr><td class="lbl">M3*（= γ=4 行為）</td><td>—</td><td>—</td><td class="best">1.319</td><td>1.264</td></tr>
+    <tr class="ours"><td class="lbl">三機制全開</td><td>1.245</td><td>1.224</td><td>1.226</td><td>1.141</td></tr>
+  </table></div>
+  <p class="note">雜訊基準：M3* 與 γ=4 行為相同，幾何平均卻差 2.5%（1.319 vs 1.287）。同一格兩輪的牆鐘吞吐量相差：AR 中位數 6.2%（最大 17%），γ=4 中位數 9.8%（最大 42%）。</p>
+</section>
+
+<section>
+  <h2>5 · 為什麼三機制全開沒有贏</h2>
+  <div class="cols">
+    <div class="card">
+      <h3>M1 <span class="pill mid">與最佳 γ 打平</span></h3>
+      <p>固定 batch 時，M1 和同步批次做的是同一種決策（整批決定何時驗證）。實測 M1 每回合每請求確認 3.60 token，γ=4 是 3.65，等於自己收斂成 γ≈4。規劃每步 0.4–0.7 ms，是淺層 step 的 5–10%（計畫書估 1%），在 launch 受限的機器上直接變成時間。</p>
+    </div>
+    <div class="card">
+      <h3>M2 <span class="pill no">淨效果為負</span></h3>
+      <p>B ≥ 8 時從未換層（k 一直是 3），只付 probe 成本（probe step 比深層 step 慢約 25%）。B = 1 時換層 10–16 次、probe 44–66 次，每次換層捨棄未驗證的草稿。</p>
+    </div>
+    <div class="card">
+      <h3>M3 <span class="pill no">與 M1 合用時有害</span></h3>
+      <p>單獨使用時新規則從不搭載，不造成損失。與 M1 合用時在 B = 8/16 搭載 17–49% 的 prefill，這些格子全部輸給 M1 單獨（例如 gsm8k B=16：1.10 vs 1.32），TTFT 從 46 ms 升到 95–324 ms。推測原因：M1 的回合長度變動大，成本檢查拿到的回合長度估計偏樂觀（尚未驗證）。</p>
+    </div>
+  </div>
+  <h3>單步拆解（cnn_dm，B = 8，同一次執行內量測）</h3>
+  <div class="tbl"><table>
+    <tr><th>設定</th><th>decode tok/s</th><th>確認 token / 回合 / 請求</th><th>規劃 ms / 步</th><th>淺層 step ms</th><th>深層 step ms</th></tr>
+    <tr><td class="lbl">同步 γ=4</td><td>510</td><td>3.65</td><td>0.06</td><td>6.92</td><td>29.6</td></tr>
+    <tr><td class="lbl">M1</td><td>462</td><td>3.60</td><td class="worse">0.39</td><td class="worse">7.79</td><td class="worse">33.0</td></tr>
+    <tr><td class="lbl">M2</td><td>504</td><td>3.63</td><td>0.06</td><td>6.98</td><td>29.3（probe 37.1）</td></tr>
+    <tr><td class="lbl">三機制全開</td><td>515</td><td>3.31</td><td>0.35</td><td>6.94</td><td>27.3（probe 31.6）</td></tr>
+  </table></div>
+  <p class="note">同一份程式碼的 γ=3 與 γ=4 淺層 step 就差 7%（7.40 vs 6.92 ms），單步數字也有同等級的雜訊。</p>
+</section>
+
+<section>
+  <h2>6 · 動態到達（Poisson，B ≤ 32，修正後）</h2>
+  <p>到達率是同步 γ=4 飽和請求率的 0.5 / 0.8 / 1.0 / 1.2 倍：cnn_dm 6.06 req/s、gsm8k 10.75 req/s。負載 0.5 與 0.8 時沒有排隊，吞吐量就等於到達率，所以比較每 token 延遲（TPOT）；負載 1.0 以上比吞吐量與含排隊的 TTFT。</p>
+  <div class="tbl"><table>
+    <tr><th>方法</th><th>0.5 · TPOT ms</th><th>0.8 · TPOT ms</th><th>1.0 · tok/s</th><th>1.0 · TTFT p99 ms</th><th>1.2 · tok/s</th><th>1.2 · TTFT 平均 ms</th></tr>
+    <tr class="grp"><td colspan="7">cnn_dm（平均輸出 214 token）</td></tr>
+    <tr><td class="lbl">AR</td><td>25.1</td><td>23.8</td><td>924</td><td class="worse">5337</td><td>969</td><td class="worse">5548</td></tr>
+    <tr><td class="lbl">同步 γ=2</td><td>18.8</td><td>21.2</td><td>1095</td><td>1414</td><td>1150</td><td>1729</td></tr>
+    <tr><td class="lbl">同步 γ=3</td><td>19.8</td><td>19.1</td><td>1115</td><td>1305</td><td>1171</td><td>2053</td></tr>
+    <tr><td class="lbl">同步 γ=4</td><td class="best">17.6</td><td>19.0</td><td>1129</td><td class="best">185</td><td class="best">1300</td><td class="best">724</td></tr>
+    <tr><td class="lbl">同步 γ=6</td><td>18.6</td><td>20.3</td><td>1085</td><td>1139</td><td>1092</td><td>2278</td></tr>
+    <tr><td class="lbl">ASPIRE</td><td class="worse">62.7</td><td class="worse">63.5</td><td class="worse">455</td><td class="worse">31206</td><td class="worse">465</td><td class="worse">22031</td></tr>
+    <tr class="ours"><td class="lbl">M1</td><td>20.0</td><td class="best">18.8</td><td>1121</td><td>1046</td><td>1203</td><td>1514</td></tr>
+    <tr><td class="lbl">M3*</td><td>19.0</td><td>19.1</td><td>1106</td><td>818</td><td>1227</td><td>1181</td></tr>
+    <tr class="ours"><td class="lbl">三機制全開</td><td>20.1</td><td>20.8</td><td class="best">1137</td><td>1393</td><td>1139</td><td>1642</td></tr>
+    <tr class="grp"><td colspan="7">gsm8k（平均輸出 67 token）</td></tr>
+    <tr><td class="lbl">AR</td><td class="best">25.9</td><td class="best">25.8</td><td>571</td><td>872</td><td>606</td><td>625</td></tr>
+    <tr><td class="lbl">同步 γ=2</td><td>26.0</td><td>27.1</td><td class="best">691</td><td>625</td><td class="best">751</td><td class="best">520</td></tr>
+    <tr><td class="lbl">同步 γ=3</td><td>28.0</td><td>30.1</td><td>665</td><td class="best">469</td><td>720</td><td>448</td></tr>
+    <tr><td class="lbl">同步 γ=4</td><td>29.8</td><td>32.5</td><td>639</td><td>632</td><td>732</td><td>658</td></tr>
+    <tr><td class="lbl">同步 γ=6</td><td>36.2</td><td>38.6</td><td>584</td><td>785</td><td>668</td><td>1000</td></tr>
+    <tr><td class="lbl">ASPIRE</td><td class="worse">78.5</td><td class="worse">81.2</td><td class="worse">359</td><td class="worse">8286</td><td class="worse">364</td><td class="worse">5863</td></tr>
+    <tr class="ours"><td class="lbl">M1</td><td>29.5</td><td>30.4</td><td>683</td><td>593</td><td>733</td><td>554</td></tr>
+    <tr><td class="lbl">M3*</td><td>31.2</td><td>31.8</td><td>651</td><td>714</td><td>707</td><td>562</td></tr>
+    <tr class="ours"><td class="lbl">三機制全開</td><td>30.6</td><td>34.3</td><td>594</td><td>1121</td><td class="worse">450</td><td class="worse">4502</td></tr>
+  </table></div>
+  <ul>
+    <li>M1 和各情境的最佳 γ 相比：飽和吞吐量差 1–7%，低負載 TPOT 差 0–14%；從來不是最差的 γ。最佳 γ 隨資料集改變（cnn_dm γ=4、gsm8k γ=2），選錯 γ=6 在 gsm8k 會慢 12–23%。</li>
+    <li>三機制全開在低負載出現 TTFT 尖峰（p99：cnn_dm 667 ms、gsm8k 808 / 3077 ms），gsm8k 過載時吞吐量掉到 450 tok/s。原因與第 5 節相同：M3 在 decoding slot 少的時候搭載。</li>
+    <li>gsm8k 低負載時沒有任何推測解碼方法贏 AR（TPOT 25.9 ms 對 26.0 以上）：B 小且輸出短時，深層省下的時間被淺層 step 抵銷。</li>
+    <li>ASPIRE 的容量（約 455 / 359 tok/s）低於所有負載，佇列持續累積。</li>
+  </ul>
+</section>
+
+<section>
+  <h2>7 · 成本模型誤差（這台機器）</h2>
+  <div class="tbl"><table>
+    <tr><th>版本</th><th>MAPE 全部</th><th>MAPE n = 64–256</th><th>狀態</th></tr>
+    <tr><td class="lbl">原始（空 kernel 迴圈量 t_op）</td><td>31.0%</td><td>27.8%</td><td class="lbl"><span class="pill no">已取代</span></td></tr>
+    <tr><td class="lbl">t_op 由實測單層反推（目前使用）</td><td>16.9%</td><td>21.6%</td><td class="lbl"><span class="pill ok">已採用</span></td></tr>
+    <tr><td class="lbl">公式改為 max(CPU 發 kernel 時間, GPU 工作時間)</td><td>11.5%</td><td>11.2%</td><td class="lbl"><span class="pill mid">離線試算，待決定</span></td></tr>
+  </table></div>
+  <p class="note">計畫書在 4090 上報告 1B 為 6.4%。剩下的誤差主要是筆電量測雜訊與加總形式在 launch 受限時重複計算。</p>
+</section>
+
+<section>
+  <h2>8 · 建議的下一步</h2>
+  <ol>
+    <li><strong>以 M1 為主要方法，先修 M2、M3 再合併：</strong>M2 加上換層遲滯，並在 k 穩定時拉長 probe 間隔；M3 的成本檢查改用 M1 規劃中的回合長度，decoding slot 少時不搭載。</li>
+    <li><strong>每格至少 3 次重複，量測時關閉 Chrome、Discord：</strong>目前格子之間 5–10% 的差異都在雜訊內。</li>
+    <li><strong>主實驗回到 4090 + 8B：</strong>這台是 launch 受限，M1 的 CPU 開銷和多 bucket 的代價被放大，結論不能直接套用。</li>
+    <li><strong>決定成本模型是否改成 max 形式</strong>（第 7 節）。</li>
+  </ol>
+  <p class="note">原始資料：results/eesd/rtx4060-1B/（第一輪）、rtx4060-1B-v2/（第二輪）、rtx4060-1B-poisson/（動態到達）、calibration/、lossless/；第一次的動態到達結果保留在 rtx4060-1B-poisson-INVALID-rate-bias/，不予採用。</p>
+</section>
+</div>

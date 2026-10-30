@@ -41,7 +41,7 @@ def _engine(model, cfg, B=3, cost="roofline"):
 def _cfg(**kw):
     from solutions.engine import EngineConfig
 
-    base = dict(k=2, d_max=6, gamma=3, probe_every=2, k_cands=(1, 2, 3, 4, 5), max_wait=100, m3_chunk_cap=3)
+    base = dict(k=2, d_max=6, gamma=3, probe_every=2, k_cands=(1, 2, 3, 4, 5), max_wait=100, m3_chunk_cap=3, m3_force=True)
     base.update(kw)
     return EngineConfig(**base)
 
@@ -507,7 +507,7 @@ def test_sensitivity_preset_changes_one_parameter_at_a_time():
     from solutions.run_ablation import PRESETS, SENS_DEFAULTS, SENSITIVITY, engine_config
 
     args = argparse.Namespace(k=3, d_max=16, sla_steps=32, probe_every=20, k_cands=[2, 3, 4], switch_margin=0.05,
-                              max_wait=3, knee_safety=0.9, prefill_chunk=512, bucketing="exact", base_gamma=4,
+                              max_wait=8, knee_safety=0.9, prefill_chunk=512, bucketing="exact", base_gamma=4,
                               omega=0.8, alpha0=0.9)
     p = PRESETS["sensitivity"]
     assert p["models"] == ["layerskip-llama3-8B"] and p["datasets"] == ["cnn_dm_summarization", "gsm8k"]

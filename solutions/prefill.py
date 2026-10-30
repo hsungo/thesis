@@ -12,10 +12,15 @@ m3         mechanism 3, depth-split piggybacking: a chunk of the pending prompt 
            chunk size  c = min(remaining, knee*s - tokens already in the shallow segment,
                                knee*s - tokens expected in the next deep segment)
            knee = measured knee of the cost model (calibrate), s = --knee-safety (default 0.9)
-           piggyback only if  dt(c) < t_prefill(c)   (marginal cost in both segments vs a separate pass)
+           piggyback only if the whole prompt is cheaper that way (n = ceil(P / c) chunks, one per round):
+               n * dt(c) + n * t_round / (n_dec + 1)  <  t_prefill(P)
+           dt(c) = marginal cost of the chunk in both segments, including the extra attention bucket;
+           n * t_round / (n_dec + 1) = the slot produces nothing for n rounds, as batch time;
+           t_prefill(P) = one separate pass over the whole prompt, which stalls the whole batch.
            fall back to `separate` when c <= 0 (no room below the knee), when the prompt would need more
-           than ``--max-wait`` deep steps, or when dt(c) >= t_prefill(c).  The decision is taken when the
-           request is assigned to a slot (`admit`); afterwards its chunks ride on every step that has room.
+           than ``--max-wait`` deep steps (a TTFT cap), or when piggybacking is not cheaper.  The decision is
+           taken when the request is assigned to a slot (`admit`); afterwards its chunks ride on every step
+           that has room.
 
 `M3Planner` is pure CPU (cost model queries only).
 """
@@ -26,9 +31,10 @@ import math
 
 
 class M3Planner:
-    def __init__(self, cost_model, max_wait: int = 3, chunk_cap: int | None = None, no_knee_chunk: int = 512,
-                 knee_safety: float = 0.9):
+    def __init__(self, cost_model, max_wait: int = 8, chunk_cap: int | None = None, no_knee_chunk: int = 512,
+                 knee_safety: float = 0.9, force: bool = False):
         self.cm, self.max_wait, self.chunk_cap = cost_model, max_wait, chunk_cap
+        self.force = force                      # tests: skip the cost check so the piggyback path is exercised
         self.no_knee_chunk = no_knee_chunk      # a model without a knee (linear) never limits the chunk: cap it
         self.knee_safety = knee_safety          # fill the step only up to knee * safety (--knee-safety)
 
@@ -50,18 +56,25 @@ class M3Planner:
         c = min(self.budget(n_sh, n_deep_est, 0), prompt_len)
         if c <= 0:
             return False, "no_room_below_knee"
-        if math.ceil(prompt_len / c) > self.max_wait:
+        n = math.ceil(prompt_len / c)
+        if n > self.max_wait:
             return False, "exceeds_max_wait"
-        if not self.worth_it(c, k, n_sh, C, n_deep_est, C, float(c)):
+        if not self.force and not self.worth_it(prompt_len, c, k, n_sh, C, n_deep_est, C):
             return False, "not_cheaper_than_separate"
         return True, "piggyback"
 
-    def worth_it(self, c: int, k: int, n_sh: int, C_sh: float, n_dp: int, C_dp: float, C_chunk: float) -> bool:
-        """dt(c) < t_prefill(c): marginal time of carrying c tokens in both segments vs a separate pass."""
-        L = self.cm.dims.n_layers
-        dt = (float(self.cm.t_segment(k, n_sh + c, C_sh + C_chunk)) - float(self.cm.t_segment(k, n_sh, C_sh))
-              + float(self.cm.t_segment(L - k, n_dp + c, C_dp + C_chunk)) - float(self.cm.t_segment(L - k, n_dp, C_dp)))
-        return dt < float(self.cm.t_prefill(c, C_chunk))
+    def worth_it(self, prompt_len: int, c: int, k: int, n_sh: int, C_sh: float, n_dp: int, C_dp: float) -> bool:
+        """Whole-prompt comparison: n chunks of marginal cost dt(c) (both segments, one more attention bucket)
+        plus the n rounds the slot sits idle, as batch time, vs one separate pass over the prompt."""
+        cm, L = self.cm, self.cm.dims.n_layers
+        n = math.ceil(prompt_len / c)
+        C_chunk = float(prompt_len) / 2 + c / 2          # mean cached positions a chunk reads (pos0 + c)
+        dt = (float(cm.t_segment(k, n_sh + c, C_sh + C_chunk, 2)) - float(cm.t_segment(k, n_sh, C_sh))
+              + float(cm.t_segment(L - k, n_dp + c, C_dp + C_chunk, 2)) - float(cm.t_segment(L - k, n_dp, C_dp)))
+        n_dec = max(n_sh, 1)
+        round_len = max(n_dp / n_dec - 1, 1.0)            # n_dp = n_dec * (round_len + 1)
+        t_round = round_len * float(cm.t_sh(n_dec, k, C_sh)) + float(cm.t_deep(n_dp, k, C_sh, n_dec, 1, C_dp))
+        return n * dt + n * t_round / (n_dec + 1) < float(cm.t_prefill(prompt_len, prompt_len / 2))
 
 
 def chunk_kv_positions(pos0: int, c: int) -> float:

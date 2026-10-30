@@ -57,10 +57,10 @@ COMPARE = ["fsm-sync", "aspire-fsm", "m1-oracle"]      # comparison schedulers +
 
 # one-at-a-time sensitivity: every value differs from the default of that parameter; base config = "all"
 SENSITIVITY = {"sla_steps": [8, 16, 32, 64], "d_max": [8, 16], "omega": [0.6, 0.8, 0.9], "alpha0": [0.7, 0.9],
-               "probe_every": [10, 20, 50], "switch_margin": [0.02, 0.05, 0.1], "max_wait": [1, 3, 5],
+               "probe_every": [10, 20, 50], "switch_margin": [0.02, 0.05, 0.1], "max_wait": [3, 8, 16],
                "knee_safety": [0.8, 0.9, 1.0]}
 SENS_DEFAULTS = {"sla_steps": 32, "d_max": 16, "omega": 0.8, "alpha0": 0.9, "probe_every": 20, "switch_margin": 0.05,
-                 "max_wait": 3, "knee_safety": 0.9}
+                 "max_wait": 8, "knee_safety": 0.9}
 SENS_CONFIGS = ["ar", "all"] + [f"all@{p}={v}" for p, vals in SENSITIVITY.items() for v in vals if v != SENS_DEFAULTS[p]]
 
 PRESETS = {
@@ -84,8 +84,8 @@ PRESETS = {
     "sensitivity": dict(models=["layerskip-llama3-8B"], datasets=["cnn_dm_summarization", "gsm8k"], lengths=[512],
                         batch_sizes=[4, 16], configs=SENS_CONFIGS, reps=3),
     "poisson": dict(models=["layerskip-llama3-8B"], datasets=["cnn_dm_summarization", "gsm8k"], lengths=[512],
-                    batch_sizes=[32], configs=["ar", "fixed-g4", "aspire", "m1", "m3", "all"], reps=3,
-                    poisson_loads=[0.5, 0.8, 1.0]),
+                    batch_sizes=[32], configs=["ar", "fixed-g2", "fixed-g3", "fixed-g4", "fixed-g6", "aspire", "m1", "m3", "all"],
+                    reps=3, poisson_loads=[0.5, 0.8, 1.0, 1.2]),
 }
 
 
@@ -239,11 +239,18 @@ def run(args) -> None:
                                         f"{args.prompts_per_workload} --length-mode {args.length_mode} --seed {args.seed}")
                                 ref = load_ref(rp, cfg.k)
                             t0 = time.time()
+
+                            def make_engine(name):
+                                c, cst = engine_config(name, args)
+                                return EESDEngine(model, B, max_p, args.max_new_tokens, eos, c, cms[cst],
+                                                  stop_for=lambda pid: stops.get(pid.split("/")[0]))
                             try:
+                                rate_ref = (poisson_ref_rate(d, rep, make_engine, prompts, args, B)
+                                            if args.poisson_loads else None)
                                 eng = EESDEngine(model, B, max_p, args.max_new_tokens, eos, cfg, cms[cost],
                                                  stop_for=lambda pid: stops.get(pid.split("/")[0]), ref=ref)
                                 if args.poisson_loads:
-                                    res = run_poisson_series(eng, prompts, args, max_p, B, rep)
+                                    res = run_poisson_series(eng, prompts, args, max_p, B, rep, rate_ref)
                                 else:
                                     res = eng.run(prompts, "cyclic", min_eval_per_slot=args.min_eval_per_slot,
                                                   max_eval=args.max_eval, keep_outputs=args.keep_outputs)
@@ -272,19 +279,42 @@ def run(args) -> None:
     summarize(out)
 
 
-def run_poisson_series(eng, prompts, args, max_p, B, rep):
-    """Poisson mode: the offered load is a multiple of this config's own saturated rate measured by a
-    short closed-loop run (requests/s = load * saturated tok/s / mean output length)."""
+def saturated_rate(eng, prompts, B) -> tuple[dict, float]:
+    """Short closed-loop run -> (result, requests/s = e2e tok/s / mean output length)."""
     sat = eng.run(prompts, "cyclic", min_eval_per_slot=1.0, max_eval=max(2 * B, 16))
     gen = [c["generated"] for c in sat["completions"] if c["measured"]] or [128]
-    rate_sat = (sat["metrics"]["e2e_throughput_tok_s"] or 1.0) / float(np.mean(gen))
+    return sat, (sat["metrics"]["e2e_throughput_tok_s"] or 1.0) / float(np.mean(gen))
+
+
+def poisson_ref_rate(d: Path, rep: int, make_engine, prompts, args, B) -> float:
+    """Saturated request rate of the reference config (--poisson-ref), measured once per workload, B and
+    repetition and cached next to the runs, so that every config sees the same arrival process."""
+    f = d / f"poisson_ref_rep{rep}.txt"
+    if f.exists():
+        return float(f.read_text().split()[0])
+    sat = make_engine(args.poisson_ref).run(prompts, "cyclic", min_eval_per_slot=args.min_eval_per_slot,
+                                            max_eval=args.max_eval)
+    # mean output length over the pool (every prompt once): completions of a closed-loop window are biased
+    # toward short requests, which would overstate the request rate
+    gen = [c["generated"] for c in make_engine(args.poisson_ref).run(prompts, "static")["completions"]]
+    rate = (sat["metrics"]["wall_throughput_tok_s"] or 1.0) / float(np.mean(gen))
+    f.write_text(f"{rate} req/s  saturated rate of {args.poisson_ref} "
+                 f"({sat['metrics']['wall_throughput_tok_s']:.1f} wall tok/s / {np.mean(gen):.1f} mean output tokens)\n")
+    return rate
+
+
+def run_poisson_series(eng, prompts, args, max_p, B, rep, rate_ref):
+    """Poisson mode: every config gets the same offered loads, multiples of the reference config's
+    saturated rate (rate_ref, requests/s); this config's own saturated closed-loop run is kept too."""
+    sat, _ = saturated_rate(eng, prompts, B)
     series = {"saturated": sat["metrics"]}
     from solutions.engine import EESDEngine
     for load in args.poisson_loads:
         e2 = EESDEngine(eng.m, B, max_p, args.max_new_tokens, eng.eos, eng.cfg, eng.cm, eng.stop_for)
-        r = e2.run_poisson(prompts, load * rate_sat, args.poisson_requests, warm_requests=B, seed=rep)
+        r = e2.run_poisson(prompts, load * rate_ref, args.poisson_requests, warm_requests=B, seed=rep)
         series[f"load{load}"] = r["metrics"]
-    return {"metrics": series["saturated"], "poisson": series, "engine_config": sat["engine_config"], "completions": []}
+    return {"metrics": series["saturated"], "poisson": series, "poisson_ref_rate_per_s": rate_ref,
+            "engine_config": sat["engine_config"], "completions": []}
 
 
 def iter_plan(args):
@@ -319,8 +349,9 @@ def summarize(out: Path) -> None:
         if "poisson" in d:
             for lab, pm in d["poisson"].items():
                 if lab != "saturated":
-                    rows[-1][f"{lab}_wall_tok_s"] = pm.get("wall_throughput_tok_s")
-                    rows[-1][f"{lab}_ttft_ms_p99"] = pm.get("ttft_ms_p99")
+                    for mk in ("wall_throughput_tok_s", "ttft_ms_mean", "ttft_ms_p99", "wall_ttft_ms_mean", "wall_ttft_ms_p99", "tpot_ms_mean", "tpot_ms_p99",
+                               "queue_left"):
+                        rows[-1][f"{lab}_{mk}"] = pm.get(mk)
     if not rows:
         print("[ablation] no runs yet")
         return
@@ -421,6 +452,8 @@ def main() -> None:
     ap.add_argument("--reps", type=int)
     ap.add_argument("--poisson-loads", nargs="+", type=float, default=None)
     ap.add_argument("--poisson-requests", type=int, default=96)
+    ap.add_argument("--poisson-ref", default="fixed-g4",
+                    help="offered loads are multiples of this config's saturated rate (same for every config)")
     ap.add_argument("--length-mode", choices=["exact", "cap"], default="exact",
                     help="exact: left-truncate to exactly L, drop shorter prompts; cap: truncate longer ones only")
     ap.add_argument("--prompts-per-workload", type=int, default=64)
@@ -433,7 +466,7 @@ def main() -> None:
     ap.add_argument("--probe-every", type=int, default=20)
     ap.add_argument("--k-cands", nargs="+", type=int, default=[2, 3, 4, 5, 6, 7, 8])
     ap.add_argument("--switch-margin", type=float, default=0.05)
-    ap.add_argument("--max-wait", type=int, default=3)
+    ap.add_argument("--max-wait", type=int, default=8, help="M3 TTFT cap (deep steps); the cost check decides below it")
     ap.add_argument("--knee-safety", type=float, default=0.9, help="M3 fills a step up to measured knee * safety")
     ap.add_argument("--prefill-chunk", type=int, default=512)
     ap.add_argument("--bucketing", choices=["exact", "pad"], default="exact")

@@ -1,0 +1,194 @@
+{
+  "args": {
+    "model": "layerskip-llama3-1B",
+    "device": null,
+    "dtype": "fp32",
+    "datasets": [
+      "gsm8k",
+      "cnn_dm_summarization"
+    ],
+    "length": 256,
+    "prompts": 16,
+    "batch_size": 8,
+    "max_new_tokens": 96,
+    "k": 3,
+    "probe_every": 4,
+    "calibration_dir": "C:\\Users\\USER\\Desktop\\New folder\\thesis\\results\\eesd\\calibration",
+    "seed": 0
+  },
+  "rows": [
+    {
+      "config": "ar B=8 (floor)",
+      "identical": 1.0,
+      "prefix_agreement": 1.0
+    },
+    {
+      "config": "fixed-g4-k3-separate [roofline]",
+      "identical": 1.0,
+      "prefix_agreement": 1.0,
+      "k_switches": 0,
+      "piggybacked": 0
+    },
+    {
+      "config": "fixed-g4-k3-separate [linear]",
+      "identical": 1.0,
+      "prefix_agreement": 1.0,
+      "k_switches": 0,
+      "piggybacked": 0
+    },
+    {
+      "config": "fixed-g4-k3-m3 [roofline]",
+      "identical": 1.0,
+      "prefix_agreement": 1.0,
+      "k_switches": 0,
+      "piggybacked": 4096
+    },
+    {
+      "config": "fixed-g4-k3-m3 [linear]",
+      "identical": 1.0,
+      "prefix_agreement": 1.0,
+      "k_switches": 0,
+      "piggybacked": 7936
+    },
+    {
+      "config": "fixed-g4-m2-separate [roofline]",
+      "identical": 1.0,
+      "prefix_agreement": 1.0,
+      "k_switches": 0,
+      "piggybacked": 0
+    },
+    {
+      "config": "fixed-g4-m2-separate [linear]",
+      "identical": 1.0,
+      "prefix_agreement": 1.0,
+      "k_switches": 0,
+      "piggybacked": 0
+    },
+    {
+      "config": "fixed-g4-m2-m3 [roofline]",
+      "identical": 1.0,
+      "prefix_agreement": 1.0,
+      "k_switches": 0,
+      "piggybacked": 4096
+    },
+    {
+      "config": "fixed-g4-m2-m3 [linear]",
+      "identical": 1.0,
+      "prefix_agreement": 1.0,
+      "k_switches": 0,
+      "piggybacked": 7936
+    },
+    {
+      "config": "aspire-k3-separate [roofline]",
+      "identical": 1.0,
+      "prefix_agreement": 1.0,
+      "k_switches": 0,
+      "piggybacked": 0
+    },
+    {
+      "config": "aspire-k3-separate [linear]",
+      "identical": 1.0,
+      "prefix_agreement": 1.0,
+      "k_switches": 0,
+      "piggybacked": 0
+    },
+    {
+      "config": "aspire-k3-m3 [roofline]",
+      "identical": 1.0,
+      "prefix_agreement": 1.0,
+      "k_switches": 0,
+      "piggybacked": 6400
+    },
+    {
+      "config": "aspire-k3-m3 [linear]",
+      "identical": 1.0,
+      "prefix_agreement": 1.0,
+      "k_switches": 0,
+      "piggybacked": 7936
+    },
+    {
+      "config": "aspire-m2-separate [roofline]",
+      "identical": 1.0,
+      "prefix_agreement": 1.0,
+      "k_switches": 11,
+      "piggybacked": 0
+    },
+    {
+      "config": "aspire-m2-separate [linear]",
+      "identical": 1.0,
+      "prefix_agreement": 1.0,
+      "k_switches": 7,
+      "piggybacked": 0
+    },
+    {
+      "config": "aspire-m2-m3 [roofline]",
+      "identical": 1.0,
+      "prefix_agreement": 1.0,
+      "k_switches": 5,
+      "piggybacked": 5376
+    },
+    {
+      "config": "aspire-m2-m3 [linear]",
+      "identical": 1.0,
+      "prefix_agreement": 1.0,
+      "k_switches": 11,
+      "piggybacked": 7680
+    },
+    {
+      "config": "m1-k3-separate [roofline]",
+      "identical": 1.0,
+      "prefix_agreement": 1.0,
+      "k_switches": 0,
+      "piggybacked": 0
+    },
+    {
+      "config": "m1-k3-separate [linear]",
+      "identical": 1.0,
+      "prefix_agreement": 1.0,
+      "k_switches": 0,
+      "piggybacked": 0
+    },
+    {
+      "config": "m1-k3-m3 [roofline]",
+      "identical": 1.0,
+      "prefix_agreement": 1.0,
+      "k_switches": 0,
+      "piggybacked": 6144
+    },
+    {
+      "config": "m1-k3-m3 [linear]",
+      "identical": 1.0,
+      "prefix_agreement": 1.0,
+      "k_switches": 0,
+      "piggybacked": 7936
+    },
+    {
+      "config": "m1-m2-separate [roofline]",
+      "identical": 1.0,
+      "prefix_agreement": 1.0,
+      "k_switches": 1,
+      "piggybacked": 0
+    },
+    {
+      "config": "m1-m2-separate [linear]",
+      "identical": 1.0,
+      "prefix_agreement": 1.0,
+      "k_switches": 1,
+      "piggybacked": 0
+    },
+    {
+      "config": "m1-m2-m3 [roofline]",
+      "identical": 1.0,
+      "prefix_agreement": 1.0,
+      "k_switches": 0,
+      "piggybacked": 6144
+    },
+    {
+      "config": "m1-m2-m3 [linear]",
+      "identical": 1.0,
+      "prefix_agreement": 1.0,
+      "k_switches": 2,
+      "piggybacked": 7936
+    }
+  ]
+}

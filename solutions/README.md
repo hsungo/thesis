@@ -66,7 +66,7 @@ CPU 測試在 `tests/test_eesd.py`（`python -m pytest`，不需要 GPU），涵
   - 塊大小 `c = min(剩餘, knee·s − 這一步淺段的 token 數, knee·s − 預估下一個深段的 token 數)`。knee 是校準實測的膝點（不再用峰值 F 推算；舊算法約 169 tokens，實測約 104），s = `--knee-safety`（預設 0.9）。
   - 每塊在某一步的淺段跑 `[0,k)`，存下第 k 層的 hidden state；在下一個 deep step 的深段跑 `[k,L)`。每層的 KV 都會寫入，後面的塊可以 attend 到前面的塊。
   - 最後一塊做完時產生第一個 token，該 request 從 d = 0 開始 draft。
-  - 退回一般 prefill 的條件（在 request 進入 slot 時判斷）：沒有低於膝點的空間、需要超過 `--max-wait` 個 deep step，或成本模型估計 Δt(c) ≥ 另外跑的時間。原因記在 `m3_fallback_reasons`。
+  - 退回一般 prefill 的條件（在 request 進入 slot 時判斷）：沒有低於膝點的空間、需要超過 `--max-wait`（預設 8，只是 TTFT 上限）個 deep step，或成本模型估計整個 prompt 搭載不比另外跑便宜：`n·Δt(c) + n·t_round/(n_dec+1) ≥ t_prefill(P)`，n = ⌈P/c⌉；Δt(c) 含多一個 attention bucket 的 kernel，`n·t_round/(n_dec+1)` 是該 slot 空等 n 輪的代價，t_prefill(P) 是整個 prompt 一次跑完（整批暫停）。原因記在 `m3_fallback_reasons`。
   - 若所有 slot 都還在 prefill（沒有 decoding slot），會直接在同一步把整塊跑完深淺兩段，避免卡住。
 
 ## 比較對象（不是方法）
@@ -88,7 +88,7 @@ LayerSkip Llama3-8B，cnn_dm_summarization 與 gsm8k，L = 512，B ∈ {4, 16}�
 | α₀ | 0.7, **0.9** |
 | probe_every | 10, **20**, 50 |
 | switch_margin | 0.02, **0.05**, 0.1 |
-| max_wait | 1, **3**, 5 |
+| max_wait | 3, **8**, 16 |
 | knee_safety | 0.8, **0.9**, 1.0 |
 
 `@參數=值` 也能加在其他任何 config 後面（可覆寫的參數見 `run_ablation.py` 的 `OVERRIDABLE`）。
