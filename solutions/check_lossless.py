@@ -53,6 +53,8 @@ def main() -> None:
     ap.add_argument("--probe-every", type=int, default=4, help="small so that M2 probes / switches happen")
     ap.add_argument("--calibration-dir", default=str(RESULTS / "calibration"))
     ap.add_argument("--seed", type=int, default=0)
+    ap.add_argument("--graphs", action="store_true", help="every combination with CUDA graphs (AR reference stays eager)")
+    ap.add_argument("--out", default=str(RESULTS / "lossless"))
     args = ap.parse_args()
     seed_everything(args.seed)
     name = Path(args.model).name
@@ -83,21 +85,29 @@ def main() -> None:
     rows.append({"config": f"ar B={args.batch_size} (floor)", "identical": s, "prefix_agreement": p})
     for sched, ex, pf, cost in itertools.product(["fixed", "aspire", "m1"], ["fixed", "m2"], ["separate", "m3"],
                                                  list(cms)):
-        cfg = EngineConfig(sched=sched, exit=ex, prefill=pf, k=args.k, probe_every=args.probe_every)
+        cfg = EngineConfig(sched=sched, exit=ex, prefill=pf, k=args.k, probe_every=args.probe_every, graphs=args.graphs)
         out, m = run(cfg, cost, args.batch_size)
         s, p = agreement(out, ref)
         rows.append({"config": f"{cfg.label()} [{cost}]", "identical": s, "prefix_agreement": p,
-                     "k_switches": max(len(m["k_timeline"]) - 1, 0), "piggybacked": m["prefill_tokens_piggyback"]})
+                     "k_switches": max(len(m["k_timeline"]) - 1, 0), "piggybacked": m["prefill_tokens_piggyback"],
+                     "graph_step_share": m.get("graph_step_share")})
         print(f"[lossless] {rows[-1]['config']:40s} identical {100 * s:5.1f}%  prefix {100 * p:5.1f}%", flush=True)
-    out_dir = RESULTS / "lossless"
+    if args.graphs:
+        out_g, _ = run(EngineConfig(mode="ar", graphs=True), "roofline", args.batch_size)
+        s, p = agreement(out_g, ref)
+        rows.append({"config": "ar [graphs]", "identical": s, "prefix_agreement": p})
+        print(f"[lossless] ar [graphs] identical {100 * s:5.1f}%", flush=True)
+    out_dir = Path(args.out)
     out_dir.mkdir(parents=True, exist_ok=True)
-    tag = f"{name}_{args.dtype}"
+    tag = f"{name}_{args.dtype}" + ("_graphs" if args.graphs else "")
     (out_dir / f"{tag}.json").write_text(json.dumps({"args": vars(args), "rows": rows}, indent=2))
     md = [f"# Losslessness vs AR(B=1): {name}, {args.dtype}, {len(prompts)} prompts, max_new {args.max_new_tokens}", "",
-          "| config | identical outputs | mean prefix agreement | k switches | piggybacked prompt tokens |",
-          "|---|---|---|---|---|"]
+          "| config | identical outputs | mean prefix agreement | k switches | piggybacked prompt tokens | graph steps |",
+          "|---|---|---|---|---|---|"]
+    def gs(r):
+        return "" if r.get("graph_step_share") is None else f"{100 * r['graph_step_share']:.0f}%"
     md += [f"| {r['config']} | {100 * r['identical']:.1f}% | {100 * r['prefix_agreement']:.1f}% | {r.get('k_switches', '')} | "
-           f"{r.get('piggybacked', '')} |" for r in rows]
+           f"{r.get('piggybacked', '')} | {gs(r)} |" for r in rows]
     (out_dir / f"{tag}.md").write_text("\n".join(md) + "\n")
     bad = [r for r in rows[1:] if r["identical"] < 1.0]
     print(f"[lossless] {len(rows) - 1} combinations, {len(bad)} not identical to AR -> {out_dir / tag}.md")

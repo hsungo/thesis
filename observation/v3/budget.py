@@ -8,7 +8,8 @@ Every run: EngineConfig(segment_timing=True, log_rounds=True) - CUDA events betw
 and a host-side log of every step (token counts, attention lengths, drafters, verifications).  While a run
 executes, nvidia-smi samples the SM clock, memory clock, temperature and power every 500 ms.
 After each run the KV-read slope is measured on the same engine: one segment (same rows, same T) at L = 64 and
-at the largest L of the run, 20 times each; attention/KV time of a step = slope * (L_step - 64).
+at the largest L of the run, 50 times each (median); attention/KV time of a step = max(slope, 0) * (L_step - 64)
+(a launch-bound eager segment can measure a slope of ~0 or slightly < 0: the raw slope is kept in the run JSON).
 Raw: results/observe-4060/runs/<task>/B<B>/<config>_<mode>_rep<r>.json (not in git).
 """
 
@@ -61,7 +62,7 @@ class Telemetry:
 
 # ------------------------------------------------------------------------------ KV slope
 
-def _time(fn, dev, n=20, warm=3) -> float:
+def _time(fn, dev, n=50, warm=5) -> float:
     import torch
     ts = []
     for i in range(warm + n):
@@ -206,25 +207,28 @@ def budget_of_run(res: dict) -> dict:
     B = res["run"]["B"]
     c = {k: 0.0 for k in COMP}
     up_gpu = 0.0
+
+    def slope(key):
+        return max(slopes.get(key, {}).get("slope_ms_per_pos", 0.0), 0.0)
     for e in log:
         if not e["measured"]:
             continue
         sg = e.get("seg_ms", {})
         if e["kind"] == "ar":
-            kv = slopes.get("ar:1", {}).get("slope_ms_per_pos", 0.0) * max(e["L_sh"] - 64, 0)
+            kv = slope("ar:1") * max(e["L_sh"] - 64, 0)
             c["dp_attn_kv"] += kv
             c["dp_layers"] += sg.get("layers", 0.0) - kv
             c["dp_head"] += sg.get("head", 0.0)
             up_gpu += sg.get("upload", 0.0)
             continue
-        kv = slopes.get("sh:1", {}).get("slope_ms_per_pos", 0.0) * max(e["L_sh"] - 64, 0)
+        kv = slope("sh:1") * max(e["L_sh"] - 64, 0)
         c["sh_attn_kv"] += kv
         c["sh_layers"] += sg.get("sh_layers", 0.0) - kv
         c["sh_head"] += sg.get("sh_head", 0.0)
         up_gpu += sg.get("upload", 0.0) + sg.get("dp_meta", 0.0)
         if e["kind"] != "shallow" and e["verifiers"]:
             T = (e["pad_dp"] // B) if e["graph"] else max(v["d"] for v in e["verifiers"]) + 1
-            kvd = slopes.get(f"dp:{T}", {}).get("slope_ms_per_pos", 0.0) * max(e["L_dp"] - 64, 0)
+            kvd = slope(f"dp:{T}") * max(e["L_dp"] - 64, 0)
             c["dp_attn_kv"] += kvd
             c["dp_layers"] += sg.get("dp_layers", 0.0) - kvd
             c["dp_head"] += sg.get("dp_head", 0.0)

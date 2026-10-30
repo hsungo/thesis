@@ -1,0 +1,225 @@
+{
+  "args": {
+    "model": "layerskip-llama3-1B",
+    "device": null,
+    "dtype": "fp32",
+    "datasets": [
+      "gsm8k",
+      "cnn_dm_summarization"
+    ],
+    "length": 256,
+    "prompts": 16,
+    "batch_size": 8,
+    "max_new_tokens": 96,
+    "k": 3,
+    "probe_every": 4,
+    "calibration_dir": "C:\\Users\\USER\\Desktop\\New folder\\thesis\\results\\eesd\\calibration",
+    "seed": 0,
+    "graphs": true,
+    "out": "results/observe-4060/lossless"
+  },
+  "rows": [
+    {
+      "config": "ar B=8 (floor)",
+      "identical": 1.0,
+      "prefix_agreement": 1.0
+    },
+    {
+      "config": "fixed-g4-k3-separate [roofline]",
+      "identical": 1.0,
+      "prefix_agreement": 1.0,
+      "k_switches": 0,
+      "piggybacked": 0,
+      "graph_step_share": 1.0
+    },
+    {
+      "config": "fixed-g4-k3-separate [linear]",
+      "identical": 1.0,
+      "prefix_agreement": 1.0,
+      "k_switches": 0,
+      "piggybacked": 0,
+      "graph_step_share": 1.0
+    },
+    {
+      "config": "fixed-g4-k3-m3 [roofline]",
+      "identical": 1.0,
+      "prefix_agreement": 1.0,
+      "k_switches": 0,
+      "piggybacked": 4096,
+      "graph_step_share": 0.5862068965517241
+    },
+    {
+      "config": "fixed-g4-k3-m3 [linear]",
+      "identical": 1.0,
+      "prefix_agreement": 1.0,
+      "k_switches": 0,
+      "piggybacked": 7936,
+      "graph_step_share": 0.8125
+    },
+    {
+      "config": "fixed-g4-m2-separate [roofline]",
+      "identical": 1.0,
+      "prefix_agreement": 1.0,
+      "k_switches": 0,
+      "piggybacked": 0,
+      "graph_step_share": 0.95
+    },
+    {
+      "config": "fixed-g4-m2-separate [linear]",
+      "identical": 1.0,
+      "prefix_agreement": 1.0,
+      "k_switches": 0,
+      "piggybacked": 0,
+      "graph_step_share": 0.95
+    },
+    {
+      "config": "fixed-g4-m2-m3 [roofline]",
+      "identical": 1.0,
+      "prefix_agreement": 1.0,
+      "k_switches": 0,
+      "piggybacked": 4096,
+      "graph_step_share": 0.5568965517241379
+    },
+    {
+      "config": "fixed-g4-m2-m3 [linear]",
+      "identical": 1.0,
+      "prefix_agreement": 1.0,
+      "k_switches": 0,
+      "piggybacked": 7936,
+      "graph_step_share": 0.7785714285714286
+    },
+    {
+      "config": "aspire-k3-separate [roofline]",
+      "identical": 1.0,
+      "prefix_agreement": 1.0,
+      "k_switches": 0,
+      "piggybacked": 0,
+      "graph_step_share": 1.0
+    },
+    {
+      "config": "aspire-k3-separate [linear]",
+      "identical": 1.0,
+      "prefix_agreement": 1.0,
+      "k_switches": 0,
+      "piggybacked": 0,
+      "graph_step_share": 1.0
+    },
+    {
+      "config": "aspire-k3-m3 [roofline]",
+      "identical": 1.0,
+      "prefix_agreement": 1.0,
+      "k_switches": 0,
+      "piggybacked": 6400,
+      "graph_step_share": 0.7842105263157895
+    },
+    {
+      "config": "aspire-k3-m3 [linear]",
+      "identical": 1.0,
+      "prefix_agreement": 1.0,
+      "k_switches": 0,
+      "piggybacked": 7936,
+      "graph_step_share": 0.92
+    },
+    {
+      "config": "aspire-m2-separate [roofline]",
+      "identical": 1.0,
+      "prefix_agreement": 1.0,
+      "k_switches": 11,
+      "piggybacked": 0,
+      "graph_step_share": 0.8258575197889182
+    },
+    {
+      "config": "aspire-m2-separate [linear]",
+      "identical": 1.0,
+      "prefix_agreement": 1.0,
+      "k_switches": 7,
+      "piggybacked": 0,
+      "graph_step_share": 0.8060941828254847
+    },
+    {
+      "config": "aspire-m2-m3 [roofline]",
+      "identical": 1.0,
+      "prefix_agreement": 1.0,
+      "k_switches": 5,
+      "piggybacked": 5376,
+      "graph_step_share": 0.6311475409836066
+    },
+    {
+      "config": "aspire-m2-m3 [linear]",
+      "identical": 1.0,
+      "prefix_agreement": 1.0,
+      "k_switches": 11,
+      "piggybacked": 7680,
+      "graph_step_share": 0.7231920199501247
+    },
+    {
+      "config": "m1-k3-separate [roofline]",
+      "identical": 1.0,
+      "prefix_agreement": 1.0,
+      "k_switches": 0,
+      "piggybacked": 0,
+      "graph_step_share": 1.0
+    },
+    {
+      "config": "m1-k3-separate [linear]",
+      "identical": 1.0,
+      "prefix_agreement": 1.0,
+      "k_switches": 0,
+      "piggybacked": 0,
+      "graph_step_share": 1.0
+    },
+    {
+      "config": "m1-k3-m3 [roofline]",
+      "identical": 1.0,
+      "prefix_agreement": 1.0,
+      "k_switches": 0,
+      "piggybacked": 6144,
+      "graph_step_share": 0.5635964912280702
+    },
+    {
+      "config": "m1-k3-m3 [linear]",
+      "identical": 1.0,
+      "prefix_agreement": 1.0,
+      "k_switches": 0,
+      "piggybacked": 7936,
+      "graph_step_share": 0.8246445497630331
+    },
+    {
+      "config": "m1-m2-separate [roofline]",
+      "identical": 1.0,
+      "prefix_agreement": 1.0,
+      "k_switches": 1,
+      "piggybacked": 0,
+      "graph_step_share": 0.9302884615384616
+    },
+    {
+      "config": "m1-m2-separate [linear]",
+      "identical": 1.0,
+      "prefix_agreement": 1.0,
+      "k_switches": 1,
+      "piggybacked": 0,
+      "graph_step_share": 0.926208651399491
+    },
+    {
+      "config": "m1-m2-m3 [roofline]",
+      "identical": 1.0,
+      "prefix_agreement": 1.0,
+      "k_switches": 0,
+      "piggybacked": 6144,
+      "graph_step_share": 0.5241228070175439
+    },
+    {
+      "config": "m1-m2-m3 [linear]",
+      "identical": 1.0,
+      "prefix_agreement": 1.0,
+      "k_switches": 2,
+      "piggybacked": 7936,
+      "graph_step_share": 0.7905236907730673
+    },
+    {
+      "config": "ar [graphs]",
+      "identical": 1.0,
+      "prefix_agreement": 1.0
+    }
+  ]
+}

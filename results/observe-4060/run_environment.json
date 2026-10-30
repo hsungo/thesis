@@ -1,0 +1,15 @@
+﻿{
+    "started":  "2026-10-31T02:56:29.9978970+08:00",
+    "background_apps":  [
+                            "chrome x21",
+                            "Discord x6",
+                            "LINE x1",
+                            "LineCall x1",
+                            "steam x1",
+                            "steamwebhelper x8"
+                        ],
+    "battery_status":  2,
+    "power_scheme":  "Power Scheme GUID: 6fecc5ae-f350-48a5-b669-b472cb895ccf  (Turbo)",
+    "gpu_idle":  "NVIDIA GeForce RTX 4060 Laptop GPU, 210 MHz, 47, P8",
+    "git":  "727dd8e"
+}
