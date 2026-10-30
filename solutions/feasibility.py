@@ -994,10 +994,29 @@ def _py(*a) -> None:
     subprocess.run(cmd, check=True, cwd=ROOT)
 
 
+def ensure_model(name: str) -> None:
+    """Download facebook/<name> into ./models/<name> when it is missing (gated repos need `hf auth login`
+    and an accepted licence on the model page)."""
+    from common.utils import MODELS_DIR
+    if Path(name).exists() or (MODELS_DIR / name / "config.json").exists():
+        return
+    from huggingface_hub import snapshot_download
+    repo = "facebook/" + {"layerskip-llama3-1B": "layerskip-llama3.2-1B"}.get(name, name)
+    print(f"[all] downloading {repo} -> {MODELS_DIR / name}", flush=True)
+    try:
+        snapshot_download(repo, local_dir=str(MODELS_DIR / name),
+                          allow_patterns=["*.json", "*.safetensors", "tokenizer*", "*.model"])
+    except Exception as e:  # noqa: BLE001
+        raise SystemExit(f"could not download {repo} ({e}); log in with `hf auth login`, accept the licence on "
+                         f"https://huggingface.co/{repo}, or put the checkpoint in {MODELS_DIR / name}")
+
+
 def cmd_all(args) -> None:
     check_gpu(args)
     out = Path(args.out)
     ref_dir = Path(args.ref_dir) if args.ref_dir else out / "ref"
+    for name in args.models:
+        ensure_model(name)
     for name in args.models:
         p = calib_path(out, name)
         stale = p.exists() and json.loads(p.read_text())["gpu"].get("meta", {}).get("env", {}).get("gpu") != gpu_name()

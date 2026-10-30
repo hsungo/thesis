@@ -112,7 +112,8 @@ LayerSkip Llama3-8B，cnn_dm_summarization 與 gsm8k，L = 512，B ∈ {4, 16}�
 ```
 python -m solutions.feasibility all --models layerskip-llama3-8B layerskip-llama3-1B   # 在 RTX 4090 上
 ```
-`all` 會依序做：每台 GPU 自己的校準（`<out>/calibration`）、`make_ref --topk-layer 3 --freq-prompts 64 --length-mode auto`
+`all` 會依序做：`models/` 沒有模型時從 `facebook/layerskip-llama3-8B`、`facebook/layerskip-llama3.2-1B` 下載
+（8B 需要先 `hf auth login` 並在模型頁同意授權）、每台 GPU 自己的校準（`<out>/calibration`）、`make_ref --topk-layer 3 --freq-prompts 64 --length-mode auto`
 （每個位置的 exit-k top-64 id/logit、完整模型 top-32 id、prompt token、評估集外 64 個 prompt 的詞頻）、第 1 節計時、
 fixed-g4 / m1 在 B = 4, 8, 16, 32 的 cyclic 執行（`EngineConfig.log_rounds`，記錄每輪草稿、接受數、確認 token、深層 token 數）、
 離線分析與 `SUMMARY.md`。GPU 名稱不含 `--expect-gpu`（預設 4090）時拒絕寫入 `results/feasibility/`。
