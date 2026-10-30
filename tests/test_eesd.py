@@ -544,3 +544,101 @@ def test_kv_gather_share_is_reported(tiny_model, ar_ref):
     for m in (sync, indep):
         assert 0.0 <= m["kv_gather_share"] <= 1.0 and m["kv_read_bytes"] > 0
     assert indep["kv_gather_share"] >= sync["kv_gather_share"]   # per-request verification gathers more often
+
+
+# ------------------------------------------------------------------------------ feasibility logging
+
+@pytest.mark.parametrize("sched", ["fixed", "m1"])
+def test_round_log_matches_outputs(tiny_model, ar_ref, sched):
+    """--log-rounds changes nothing and its rounds rebuild every output: first token + committed tokens."""
+    prompts, ref = ar_ref
+    res = _engine(tiny_model, _cfg(sched=sched, log_rounds=True)).run(
+        prompts, "cyclic", warmup_samples=2, warmup_per_slot=0, min_eval=4, min_eval_per_slot=0, max_eval=10,
+        keep_outputs=True)
+    assert all(c["tokens"] == ref[c["pid"]] for c in res["completions"])
+    stream = {}
+    for st in res["round_log"]:
+        assert st["n_dp"] == sum(v["d"] + 1 for v in st["verifiers"])     # separate prefill: verify tokens only
+        for v in st["verifiers"]:
+            assert len(v["drafts"]) == v["d"] and 0 <= v["a"] <= v["d"]
+            n = min(v["a"], len(v["committed"]))                   # committed is cut at max_new / EOS
+            assert v["drafts"][:n] == v["committed"][:n]
+            stream.setdefault(v["uid"], []).extend(v["committed"])
+    for c in res["completions"]:
+        assert c["tokens"][:1] + stream.get(c["uid"], []) == c["tokens"]
+
+
+def test_exit_probe_topk(tiny_model, ar_ref, tmp_path):
+    from common.engine import ARBatchEngine, RunConfig
+    from common.traces import ExitProbe
+
+    prompts, _ = ar_ref
+    eng = ARBatchEngine(tiny_model, 2, 24, MAX_NEW, (2,), ignore_eos=True)
+    probe = ExitProbe(tiny_model, [1, 2, 3], topk_layer=2, topk_exit=8, topk_full=4)
+    eng.probe = probe
+    eng.run(prompts, RunConfig(mode="static"))
+    z = np.load(probe.save(tmp_path / "r.npz", {"n_layers": tiny_model.n_layers}))
+    assert z["exit_topk_ids"].shape == (len(z["tokens"]), 8) and z["full_topk_ids"].shape == (len(z["tokens"]), 4)
+    assert (z["exit_topk_ids"][:, 0] == z["exit_argmax"][:, 1]).all()
+    assert (z["full_topk_ids"][:, 0] == z["tokens"]).all()
+    assert (np.diff(z["exit_topk_logits"], axis=1) <= 0).all()
+
+
+def test_feasibility_coverage_cases():
+    """Hand-built position cases: tie with the AR token -> undetermined, unique in-V best = AR -> match,
+    no top-k token in V while the AR token is in V -> undetermined; |V| follows the R window."""
+    from solutions.feasibility import coverage_batch
+
+    req = {"prompt": np.array([1, 2]), "y": np.array([5, 5, 2, 1]), "am": np.array([0, 5, 9, 11]),
+           "tid": np.array([[0, 0, 0, 0], [5, 1, 3, 4], [9, 2, 3, 4], [11, 12, 13, 14]]),
+           "tlg": np.array([[4, 3, 2, 1], [4, 4, 2, 1], [4, 3, 2, 1], [4, 3, 2, 1]], dtype=np.float32),
+           "full": np.array([[5], [5], [2], [1]])}
+    r = coverage_batch([req], np.array([0]), R=1, K=1, top_f=np.array([], dtype=np.int64), vocab=20)
+    assert r["sizes"] == [3, 3, 2]
+    assert (r["n_pos"], r["match"], r["undet"], r["orig"]) == (3, 1, 2, 1)
+
+
+def test_feasibility_ngram_guess():
+    from solutions.feasibility import match_len, ngram_guess
+
+    ctx = np.array([1, 2, 3, 9, 1, 2, 3])
+    assert ngram_guess(ctx, 4).tolist() == [9, 1, 2, 3]          # longest earlier suffix match: [1, 2, 3]
+    assert ngram_guess(np.array([4, 5, 6]), 4).tolist() == []
+    assert match_len([9, 1, 7], [9, 1, 2, 3]) == 2 and match_len([], [1]) == 0
+
+
+def test_feasibility_log_analysis_aligns(tiny_model, ar_ref):
+    """Round positions in the log line up with the outputs, and the extension counts stay within bounds."""
+    from solutions.feasibility import extension_from_log, rounds_by_request
+
+    prompts, _ = ar_ref
+    res = _engine(tiny_model, _cfg(sched="fixed", gamma=4, log_rounds=True)).run(
+        prompts, "cyclic", warmup_samples=2, warmup_per_slot=0, min_eval=4, min_eval_per_slot=0, max_eval=10,
+        keep_outputs=True)
+    res["prompts"] = {p.pid: list(p.tokens) for p in prompts}
+    per, outs, pr = rounds_by_request(res)
+    for uid, rr in per.items():
+        for _, v in rr:
+            n_out = v["pos"] - len(pr[uid]) + 1
+            assert outs[uid][n_out:n_out + len(v["committed"])].tolist() == v["committed"]
+    t = extension_from_log(res, [4, 8])
+    assert 0 <= t[("A", 4)] <= t[("A", 8)] <= 8 * t["full"]
+    assert t["B_extra"] <= t["tail_m"] <= 3 * t["tails"]
+
+
+def test_feasibility_timing_harness_runs(tiny_model):
+    import torch
+    from solutions.feasibility import Marks, deep_step, shallow_step
+
+    m = tiny_model
+    m.allocate_cache(2, 64)
+    Dm1 = 4 + 1 + 3 + 1
+    buf = {"Dm1": Dm1, "seq": torch.randint(0, m.cfg.vocab_size, (2, Dm1)), "exh": torch.zeros(2, Dm1, m.cfg.dim)}
+    with torch.inference_mode():
+        mk = Marks(m.device, 4)
+        shallow_step(m, 2, 8, 2, buf, mk)
+        assert len(mk.segments()[0]) == 3
+        mk = Marks(m.device, 7)
+        deep_step(m, 2, 8, 2, 4, 3, buf, mk)
+        assert len(mk.segments()[0]) == 6
+    m.free_cache()

@@ -114,7 +114,8 @@ def _engine_config(name: str, args):
     base = dict(k=args.k, d_max=args.d_max, sla_steps=args.sla_steps, probe_every=args.probe_every,
                 k_cands=tuple(args.k_cands), switch_margin=args.switch_margin, max_wait=args.max_wait,
                 knee_safety=args.knee_safety,
-                prefill_chunk=args.prefill_chunk, bucketing=args.bucketing, gamma=args.base_gamma)
+                prefill_chunk=args.prefill_chunk, bucketing=args.bucketing, gamma=args.base_gamma,
+                log_rounds=getattr(args, "log_rounds", False))
     cost = "roofline"
     if name == "ar":
         return EngineConfig(mode="ar", **base), cost
@@ -267,6 +268,8 @@ def run(args) -> None:
                                           "prompts": len(pool), "max_new_tokens": args.max_new_tokens,
                                           "host": socket.gethostname(), "env": env, "argv": sys.argv,
                                           "calibration": str(calib), "wall_s": time.time() - t0}
+                            if "round_log" in res:      # --log-rounds: kept next to the run JSON
+                                f.with_name(f.stem + "_rounds.json").write_text(json.dumps(res.pop("round_log")))
                             f.write_text(json.dumps(res, default=str))
                             m = res["metrics"]
                             print(f"[ablation] {model_name} {ds} L={L} B={B:2d} {cname:12s} rep{rep}  "
@@ -473,6 +476,9 @@ def main() -> None:
     ap.add_argument("--min-eval-per-slot", type=float, default=2.0)
     ap.add_argument("--max-eval", type=int, default=256)
     ap.add_argument("--keep-outputs", action="store_true", help="store generated tokens (token agreement with AR)")
+    ap.add_argument("--log-rounds", action="store_true",
+                    help="record every verification (drafts, accepted, committed) in <config>_rep<r>_rounds.json; "
+                         "read back after the step's GPU timing interval")
     ap.add_argument("--calibration-dir", default=str(RESULTS / "calibration"))
     ap.add_argument("--ref-dir", default=str(RESULTS / "ref"), help="AR references for m1-oracle (solutions/make_ref.py)")
     ap.add_argument("--out", default=None)

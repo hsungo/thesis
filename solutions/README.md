@@ -105,6 +105,28 @@ LayerSkip Llama3-8B，cnn_dm_summarization 與 gsm8k，L = 512，B ∈ {4, 16}�
 - eager 模式，沒有 CUDA Graph；每一步的 Python 處理會反映在牆鐘吞吐量和 `host_overhead_share`。
 - cyclic 量測一開始填滿 batch 時，一律用 separate prefill（此時還沒有可以搭載的 step）。
 
+## 新 M2 / 新 M3 的可行性量測（`feasibility.py`，只量測、不實作機制）
+- 新 M2「批次聯集的動態草稿詞彙」：exit head 只算批次相關的詞，驗證仍用完整詞彙。
+- 新 M3「用深層空位驗證免費猜測」：草稿後接 n-gram 猜測或被拒的草稿尾巴，一起送進深層驗證。
+
+```
+python -m solutions.feasibility all --models layerskip-llama3-8B layerskip-llama3-1B   # 在 RTX 4090 上
+```
+`all` 會依序做：每台 GPU 自己的校準（`<out>/calibration`）、`make_ref --topk-layer 3 --freq-prompts 64 --length-mode auto`
+（每個位置的 exit-k top-64 id/logit、完整模型 top-32 id、prompt token、評估集外 64 個 prompt 的詞頻）、第 1 節計時、
+fixed-g4 / m1 在 B = 4, 8, 16, 32 的 cyclic 執行（`EngineConfig.log_rounds`，記錄每輪草稿、接受數、確認 token、深層 token 數）、
+離線分析與 `SUMMARY.md`。GPU 名稱不含 `--expect-gpu`（預設 4090）時拒絕寫入 `results/feasibility/`。
+
+| 檔案 | 內容 |
+|---|---|
+| `s1_step_timing.csv` | 淺層 / 深層 step 的 CUDA event 分段與牆鐘（B = 1..32，context 512 / 1024，深層另加 G 個猜測 / slot） |
+| `s1_lmhead_subvocab.csv` | V_sub 列的 LM head、index_select 重建 |
+| `s2_coverage.csv` | 批次聯集詞彙的 \|V\| 分布、α_V（上下界）與無法判定比例 |
+| `s3_guess_extension.csv` | n-gram（來源 A）與被拒尾巴（來源 B）每輪 / 每深層 step 多確認的 token |
+| `s4_deep_slack.csv` | knee_measured − 深層 token 數的分布 |
+
+`--log-rounds`（`run_ablation.py`）/ `log_rounds`（引擎）預設關閉；開啟時草稿在 step 的 GPU 計時區間結束後才讀回，不改變行為與 GPU 時間。
+
 ## 輸出
 執行順序（含必須停下來回報的檢查點）見 repo 根目錄 README 的「EESD 實驗」一節。輸出在 `results/eesd/<preset>/`：
 

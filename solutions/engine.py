@@ -68,6 +68,8 @@ class EngineConfig:
     m3_chunk_cap: Optional[int] = None   # tests: force small chunks
     m2_force: Optional[str] = None       # tests: "cycle"
     m3_force: bool = False               # tests: piggyback without the cost check
+    log_rounds: bool = False             # record every verification (drafts, accepted, committed); read back after
+                                         # the step's timing interval, so GPU step times are unchanged
 
     def label(self) -> str:
         if self.mode == "ar":
@@ -91,6 +93,7 @@ class Request:
     pf_sh: int = 0               # prompt tokens through the shallow segment (M3)
     pf_dp: int = 0               # prompt tokens through all layers (M3)
     piggybacked: int = 0         # prompt tokens prefilled by piggybacking (M3)
+    uid: int = -1                # assignment counter (identifies a request instance in the round log)
 
 
 @dataclass
@@ -155,6 +158,8 @@ class EESDEngine:
         self.round_len = cfg.gamma   # last observed steps per round (M3 deep-size estimate)
         self.kv_bytes_per_pos = 2 * model.cfg.n_kv_heads * model.cfg.head_dim * model.dtype.itemsize
         self.fallback_reasons: dict = {}
+        self.n_assigned = 0
+        self.round_log: list = []    # cfg.log_rounds: one entry per deep step
 
     # ------------------------------------------------------------------ helpers
     def _rec(self, kind, iv, **kw) -> Rec:
@@ -200,6 +205,8 @@ class EESDEngine:
         """Put a request in a free slot.  Separate prefill runs now (the batch pauses); M3 queues it."""
         req.rec_assign = len(self.records)
         req.measured = self.measuring
+        req.uid = self.n_assigned
+        self.n_assigned += 1
         self.req[slot] = req
         self.pending[slot] = []
         self.d[slot] = 0
@@ -357,6 +364,7 @@ class EESDEngine:
         readback = None
         n_v_tok = 0
         if deep:
+            n_chunk_dp = sum(c for i in range(self.B) for (_, c, _) in self.pending[i])
             readback, n_v_tok, vinfo, cinfo = self._deep(V, d, probe, h, pb, cap_sh)
         iv.stop()
         kind = "probe" if probe else ("deep" if deep else "shallow")
@@ -378,13 +386,25 @@ class EESDEngine:
         acc = np.array(rb[:nv], dtype=np.int64)
         Y = rb[nv:nv + n_v_tok]
         accepted = np.zeros(self.B, dtype=np.int64)
+        log = None
+        if cfg.log_rounds:      # drafts are still in seq_buf[:, 1:] (the deep step only rewrote column 0)
+            drafts = self.seq_buf[upload(vslots, self.dev)].tolist() if nv else []
+            log = {"step": len(self.records) - 1, "measured": self.measuring, "kind": kind, "B_dec": int(dec.sum()),
+                   "n_sh": int(N), "n_dp": int(n_v_tok + n_chunk_dp), "verifiers": []}
+            self.round_log.append(log)
         for j, i in enumerate(vslots):
             a = int(acc[j])
             accepted[i] = a
             toks = Y[vstarts[j]:vstarts[j] + a + 1]
+            n_out = len(self.req[i].out)
+            if log is not None:
+                log["verifiers"].append({"uid": self.req[i].uid, "pos": int(self.pos[i]), "d": int(d[i]), "a": a,
+                                         "drafts": drafts[j][1:int(d[i]) + 1]})
             self.pos[i] += a + 1
             self.d[i] = 0
             committed += self._commit(i, toks)
+            if log is not None:
+                log["verifiers"][-1]["committed"] = self.req[i].out[n_out:]
             if self.measuring and self.req[i].finish is None:
                 self.stats["drafted"] += int(d[i])
                 self.stats["accepted"] += a
@@ -685,7 +705,8 @@ class EESDEngine:
     def _completion(self, r: Request, keep: bool) -> dict:
         c = {"pid": r.pid, "prompt_len": len(r.prompt), "generated": len(r.out), "finish_reason": r.finish,
              "measured": r.measured, "rec_assign": r.rec_assign, "rec_first": r.rec_first, "rec_finish": r.rec_finish,
-             "piggybacked": r.piggybacked, "wall_ttft_s": (r.wall_first - r.wall_arrival) if r.wall_arrival else None}
+             "piggybacked": r.piggybacked, "wall_ttft_s": (r.wall_first - r.wall_arrival) if r.wall_arrival else None,
+             "uid": r.uid}
         if keep:
             c["tokens"] = list(r.out)
         return c
@@ -755,4 +776,7 @@ class EESDEngine:
             "evaluated_completions": sum(1 for c in completions if c["measured"]),
             "steps": st["steps"], "deep_steps": st["deep_steps"],
         }
-        return {"metrics": metrics, "engine_config": asdict(self.cfg), "completions": completions}
+        res = {"metrics": metrics, "engine_config": asdict(self.cfg), "completions": completions}
+        if self.cfg.log_rounds:
+            res["round_log"] = self.round_log
+        return res
