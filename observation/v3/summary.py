@@ -138,7 +138,8 @@ def main() -> None:
                       "dp_rejected": dp * f(wb["rejected_share_of_deep_time"]), "dp_all": dp,
                       "attn_kv": (f(r["sh_attn_kv"]) + f(r["dp_attn_kv"])) / w, "host": f(r["host_other"]) / w,
                       "metadata": f(r["metadata_upload"]) / w, "accept": f(r["accept_readback"]) / w,
-                      "launch": 1 - w / f(e["wall_ms_per_token"])})
+                      "launch": 1 - w / f(e["wall_ms_per_token"]),
+                      "sh_layers_k": (f(r["sh_layers"]) + f(r["sh_attn_kv"])) / w})
     write_csv(OUT / "ranking_cells.csv", cells)
     G = cheat_rows(A)
     write_csv(OUT / "G_cheats.csv", G)
@@ -156,15 +157,20 @@ def main() -> None:
         return (med(g), min(g), max(g)) if g else (float("nan"),) * 3
 
     # data quoted in the ranking table (C-F)
-    def frow(model, B, R=None):
+    def frow(model, B):
+        """Setting with the best worst-task lower bound of alpha_V/alpha (ties: smaller max |V|):
+        (worst lower, worst upper, max |V|, (R, K, F), max undetermined share)."""
         rs = [r for r in F if r["model"] == model and int(r["B"]) == B]
-        out = {}
+        best_ = None
         for key in {(r["R"], r["K"], r["F"]) for r in rs}:
             sel = [r for r in rs if (r["R"], r["K"], r["F"]) == key]
-            if len(sel) == 4:
-                out[key] = (max(int(r["V_max"]) for r in sel), min(f(r["ratio_lower"]) for r in sel))
-        ok = [(v[0], k, v[1]) for k, v in out.items() if v[1] >= 0.98]
-        return min(ok) if ok else None
+            if len(sel) < 4:
+                continue
+            c = (min(f(r["ratio_lower"]) for r in sel), min(f(r["ratio_upper"]) for r in sel),
+                 max(int(r["V_max"]) for r in sel), key, max(f(r["undetermined_share"]) for r in sel))
+            if best_ is None or (round(c[0], 3), -c[2]) > (round(best_[0], 3), -best_[2]):
+                best_ = c
+        return best_
 
     f8_16 = frow("layerskip-llama3-8B", 16)
     f8_32 = frow("layerskip-llama3-8B", 32)
@@ -181,8 +187,9 @@ def main() -> None:
     P = [  # key, name, why existing methods do not solve it, batch early-exit property (C-F), 4090 + 8B
         ("sh_head", "淺層 LM head（每個草稿都乘一次 128k 詞彙的 lm_head）",
          "LayerSkip 的 exit 共用完整的 lm_head；靜態的高頻子詞彙（如 FR-Spec）不隨批次內容改變，訓練小 head 則需要額外權重與訓練。",
-         (f"F：8B 在 B = 16 時，{'|V| 最大 ' + str(f8_16[0]) + '（R/K/F = ' + '/'.join(f8_16[1]) + '）即可讓 α_V/α ≥ ' + f'{f8_16[2]:.3f}' if f8_16 else '沒有設定讓 α_V/α ≥ 0.98'}；"
-          f"B = 32 時 {'|V| 最大 ' + str(f8_32[0]) if f8_32 else '無'}。批次越大聯集越大，但仍遠小於 128k。"),
+         (f"F：8B 在 B = 16 時，聯集詞彙最大 {f8_16[2]} 個（R/K/F = {'/'.join(f8_16[3])}，約 128k 的 {f8_16[2] / 128256:.0%}），"
+          f"exit-3 限制在其中後 α_V/α 在最差任務為 {f8_16[0]:.3f}–{f8_16[1]:.3f}（下界–上界，{f8_16[4]:.1%} 的位置 top-64 無法判定）；"
+          f"B = 32 時最大 {f8_32[2]} 個、{f8_32[0]:.3f}–{f8_32[1]:.3f}。") if f8_16 and f8_32 else "F：見第 F 節。",
          "8B 的 lm_head（1.05 GB）約等於 2.4 層 decoder 的權重，k = 3 時仍占淺層 step 讀取量的四成左右；4090 是頻寬受限，占比預期相近，不會因 launch 開銷消失而變小。"),
         ("prefill", "prefill 暫停整批（separate prefill）",
          "chunked prefill 只把 prefill 切開與 decode 混合，計算量不變；prefix cache 只省得了共用的前綴（few-shot 範例）。",
@@ -202,6 +209,7 @@ def main() -> None:
         ("accept", "接受判斷與讀回", "—", "—", "—"),
     ]
     ranked = sorted(P, key=lambda p: -ub(stat(p[0])[0]))
+    dpall_m = stat("dp_all")[0]
     write_csv(OUT / "ranking.csv", [{"problem": p[1], "share_median": stat(p[0])[0], "share_min": stat(p[0])[1],
                                      "share_max": stat(p[0])[2], "ideal_gain_median": ub(stat(p[0])[0]),
                                      "ideal_gain_max": ub(stat(p[0])[2])} for p in ranked])
@@ -216,8 +224,21 @@ def main() -> None:
       f"程式在 commit `{commit}`；420 次計時執行都在 commit `0ece9aa`（乾淨工作樹，每個 run JSON 都記錄）。")
     w("")
     w("**雜訊條件**：插電、Turbo 電源計畫；依你的指示直接開始，**Chrome、Discord、Steam、LINE 執行中沒有關閉**"
-      f"（`run_environment.json`）。每次執行用 nvidia-smi 每 500 ms 取樣：SM 時脈中位數 {med(tel_clk):.0f} MHz（最低 {np.nanmin(tel_min):.0f}），"
-      f"最高溫 {np.nanmax(tel_tmax):.0f} °C。每個點重複 3 次，報告中位數與四分位距（CSV 有 q1/q3）。")
+      f"（`run_environment.json`）。每次執行用 nvidia-smi 每 500 ms 取樣：420 次執行各自的 SM 時脈中位數在 {np.nanmin(tel_clk):.0f}–{np.nanmax(tel_clk):.0f} MHz，"
+      f"溫度最高 {np.nanmax(tel_tmax):.0f} °C（每次執行的時脈最低值是執行開頭的閒置取樣）。每個點重複 3 次，報告中位數與四分位距（CSV 有 q1/q3）。")
+    w("")
+    gh, gp, go = cheat_gain("head"), cheat_gain("prefill"), cheat_gain("oracle")
+    w("## 0. 結論")
+    w("")
+    w(f"1. 有 CUDA Graph 後（launch 開銷占無 graph 時間的 {pc(stat('launch')[0])} 被消除），1B 每個確認 token 的時間主要是：深層驗證 {pc(dpall_m)}、"
+      f"淺層 LM head {pc(stat('sh_head')[0])}、prefill {pc(stat('prefill')[0])}、淺層 3 層 {pc(med([c['sh_layers_k'] for c in cells]))}（10 格中位數）。")
+    w(f"2. 前三名問題：{'、'.join(p[1].split('（')[0] for p in top3)}。")
+    w(f"3. 上限實驗：淺層 LM head 幾乎免費時吞吐量 +{pc(gh[0])}（+{pc(gh[1])}～+{pc(gh[2])}）；prefill 幾乎免費時 +{pc(gp[0])}（+{pc(gp[1])}～+{pc(gp[2])}，"
+      f"B 越大、輸出越短越高）；完美的驗證時機（m1-oracle）只有 {pc(go[0])}（{pc(go[1])}～{pc(go[2])}），低於 10%，**不值得做**——"
+      "「淺層花在被拒草稿」的時間無法靠選擇驗證時機省下（淺層 step 在膝點以下，少算幾個 token 幾乎不省時間）。")
+    w(f"4. 輸出型觀察（8B 與 1B）：草稿接受與 exit 信心值明顯相關、請求間差異大；批次聯集詞彙只需數千個 token（8B B = 32 最多 "
+      + (str(f8_32[2]) if f8_32 else "–") + " 個）；免費猜測只有 n-gram 在摘要任務有量，跨請求與被拒尾巴幾乎沒有。")
+    w("5. 限制：時間型數據只來自 1B 與這台筆電（launch-bound、Windows），背景程式未關閉；8B 只有輸出型數據。")
     w("")
     w("## 1. 問題排序（有 CUDA Graph；1B；cnn_dm、gsm8k × B = 1–32 共 10 格，每格取最佳同步 γ）")
     w("")
@@ -227,7 +248,8 @@ def main() -> None:
     w("|---|---|---|---|---|---|---|")
     for i, p in enumerate(ranked, 1):
         m_, lo, hi = stat(p[0])
-        w(f"| {i} | {p[1]} | {pc(m_)}（{pc(lo)}–{pc(hi)}） | +{pc(ub(m_))}（+{pc(ub(hi))}） | {p[2]} | {p[3]} | {p[4]} |")
+        tag = {"launch": "（既有方法已解決，不列入前三）", "dp_rejected": "（按比例分攤高估，不列入前三）"}.get(p[0], "")
+        w(f"| {i} | {p[1]}{tag} | {pc(m_)}（{pc(lo)}–{pc(hi)}） | +{pc(ub(m_))}（+{pc(ub(hi))}） | {p[2]} | {p[3]} | {p[4]} |")
     dpall = stat("dp_all")
     w("")
     w(f"不列入排序：**深層驗證本身**占 {pc(dpall[0])}（{pc(dpall[1])}–{pc(dpall[2])}），是無損的代價；其中可省的部分就是上表的「深層花在被拒 token」。"
@@ -293,7 +315,7 @@ def main() -> None:
         w("")
     lc = stat("launch")
     w(f"這代表：有 graph 時，淺層 LM head 比淺層 3 層本身還貴（每個草稿都乘 128k × 2048 的 lm_head）；B ≥ 16 時 prefill 是最大的單一塊；"
-      f"host 開銷只剩約 {pc(stat('host')[0])}。沒有 graph 時同樣的設定慢 {pc(lc[0])}（{pc(lc[1])}–{pc(lc[2])}），差異就是 kernel 啟動開銷。"
+      f"host 開銷只剩約 {pc(stat('host')[0])}。沒有 graph 時，每 token 時間中有 {pc(lc[0])}（{pc(lc[1])}–{pc(lc[2])}）在有 graph 時消失，這就是 kernel 啟動開銷。"
       "AR 的「深層」欄是全部 L 層。KV 讀取用同一 segment 在 L = 64 與最大 L 兩點實測的斜率推得；無 graph 時 launch-bound，斜率量到約 0。")
     w("")
 
@@ -319,8 +341,13 @@ def main() -> None:
             w(f"| {r['model'][-2:]} | {SHORT[r['task']]} | {r['gamma']} | {pc(f(r['rejected_draft_share']))} | {pc(f(r['full_accept_round_share']))} | "
               f"{pc(f(r['rejected_share_of_deep_tokens']))} | {f(r['tokens_per_round']):.2f} |")
     w("")
-    w("這代表：同步 γ 同時有兩種浪費——三到五成的淺層時間花在之後被拒的草稿上，同時又有三到六成的輪次在草稿全對時停下；"
-      "單一 γ 無法同時減少兩者。8B 的拒絕率比 1B 更高。")
+    wg = [r for r in W if r["mode"] == "graph"]
+    shw = [f(r["shallow_time_on_rejected_drafts"]) for r in wg]
+    fa = [f(r["full_accept_round_share"]) for r in wg]
+    r8 = [f(r["rejected_draft_share"]) for r in Wr if "8B" in r["model"] and r["gamma"] == "4"]
+    r1 = [f(r["rejected_draft_share"]) for r in Wr if "1B" in r["model"] and r["gamma"] == "4"]
+    w(f"這代表：同步 γ 同時有兩種浪費（範圍涵蓋所有 γ 與 M1、兩個任務、所有 B）——{pc(min(shw), 0)}–{pc(max(shw), 0)} 的淺層時間花在之後被拒的草稿上，同時又有 {pc(min(fa), 0)}–{pc(max(fa), 0)} 的輪次"
+      f"在草稿全對時停下；γ 調小減少前者、增加後者，單一 γ 無法同時減少兩者（M1 也一樣）。γ = 4 時被拒草稿 8B 為 {pc(min(r8), 0)}–{pc(max(r8), 0)}，1B 為 {pc(min(r1), 0)}–{pc(max(r1), 0)}。")
     w("")
 
     # ---------------- C
@@ -357,8 +384,13 @@ def main() -> None:
         d = {x["k"]: f(x["alpha"]) for x in Ce if (x["model"], x["task"]) == key}
         w(f"| {key[0][-2:]} | {SHORT[key[1]]} | " + " | ".join(f"{d.get(str(k), np.nan):.3f}" for k in range(2, 9)) + " |")
     w("")
-    w("這代表：接受不是均勻的。越後面的草稿條件接受率越高（連續一致會延續），exit 的 top-1 機率能把 token 分成高接受與低接受兩群，"
-      "請求內有正自相關、請求間差異大，出現在 prompt 中的 token 較容易接受。這些都是「每個 slot 該停在哪裡」可以利用的訊號。")
+    l1all = [f(r["autocorr"]) for r in Ca if r["lag"] == "1"]
+    hetall = [(f(r["p10"]), f(r["p90"])) for r in Cr]
+    w(f"這代表：接受不是均勻的。前面都接受時，越後面的草稿條件接受率越高；exit 的 top-1 機率能把 token 分成高接受（≥ 0.5：{pc(acc_hi[0], 0)}–{pc(acc_hi[1], 0)}，8B）"
+      f"與低接受（< 0.5：{pc(acc_lo[0], 0)}–{pc(acc_lo[1], 0)}）兩群；請求間差異大（請求平均接受率 p10–p90 跨 {min(h[0] for h in hetall):.2f}–{max(h[1] for h in hetall):.2f}），"
+      f"請求內的自相關很弱（lag-1 為 {min(l1all):.2f}–{max(l1all):.2f}）；出現在 prompt 中的 token 在每個任務都較容易接受，8B 在 gsm8k 的數字 token 只有 "
+      + next((pc(f(x["accept_rate"]), 0) for x in Ct if "8B" in x["model"] and x["task"] == "gsm8k" and x["value"] == "digit"), "–")
+      + " 被接受。exit 6 的 α 比 exit 3 高 0.06–0.09，但 exit 2 很差。")
     w("")
 
     # ---------------- D
@@ -387,37 +419,39 @@ def main() -> None:
     for r in E:
         if r["G"] in ("4", "8", "16"):
             w(f"| {r['model'][-2:]} | {SHORT[r['task']]} | {r['source']} | {r['G']} | {pc(f(r['full_accept_share']), 0)} | {f(r['extra_per_round']):.3f} | "
-              f"{f(r.get('extra_per_round_excl_repetitive')):.3f} |")
+              f"{'–' if not np.isfinite(f(r.get('extra_per_round_excl_repetitive'))) else format(f(r.get('extra_per_round_excl_repetitive')), '.3f')} |")
     for r in Et:
         w(f"| 1B | {SHORT[r['task']]} | 被拒尾巴（實機 fixed-g4 B = 16） | ≤ 3 | – | {f(r['extra_per_round']):.3f} | – |")
     w("")
-    w("這代表：n-gram（prompt + 已生成文字）在摘要任務很高，但有一部分來自重複迴圈；跨請求和被拒尾巴幾乎沒有命中。")
+    ng8 = {(r["model"][-2:], SHORT[r["task"]]): (f(r["extra_per_round"]), f(r["extra_per_round_excl_repetitive"]))
+           for r in E if r["source"] == "ngram" and r["G"] == "8"}
+    xr = [f(r["extra_per_round"]) for r in E if r["source"] != "ngram"]
+    w("這代表：n-gram（prompt + 已生成文字）在 cnn_dm 最高（G = 8：8B " + f"{ng8[('8B', 'cnn_dm')][0]:.2f}" + " 個/輪，排除重複迴圈請求後 "
+      + f"{ng8[('8B', 'cnn_dm')][1]:.2f}）；gsm8k 的命中大多來自重複迴圈（1B {ng8[('1B', 'gsm8k')][0]:.2f} → {ng8[('1B', 'gsm8k')][1]:.2f}）。"
+      f"跨請求每輪最多 {max(xr):.2f} 個，被拒尾巴最多 {max(f(r['extra_per_round']) for r in Et):.3f} 個。注意只有草稿全接受的輪次才能用到猜測，8B 在 gsm8k 只占 "
+      + next((pc(f(r["full_accept_share"]), 0) for r in E if "8B" in r["model"] and r["task"] == "gsm8k" and r["source"] == "ngram"), "–") + "。")
     w("")
 
     # ---------------- F
     w("### F. 批次詞彙覆蓋率（輸出型，exit 3）")
     w("")
-    w("每個 B 列出「四個任務都達到 α_V/α ≥ 0.98（下界，無法判定算不一致）」且最大 |V| 最小的設定。")
+    w("每個 B 列出四個任務中最差任務的 α_V/α 下界最高的設定（相同時取最大 |V| 較小者）。下界把 top-64 無法判定的位置算成不一致，上界算成一致；完整表在 F_coverage.csv。")
     w("")
-    w("| 模型 | B | R / K / F | 四任務最大 |V| | 最差 α_V/α（下界） | 無法判定比例（最大） |")
+    w("| 模型 | B | R / K / F | 四任務最大 |V| | 最差任務 α_V/α（下界–上界） | 無法判定比例（最大） |")
     w("|---|---|---|---|---|---|")
+    fr = {}
     for model in sorted({r["model"] for r in F}):
         for B in sorted({int(r["B"]) for r in F}):
-            rs = [r for r in F if r["model"] == model and int(r["B"]) == B]
-            best_ = None
-            for key in {(r["R"], r["K"], r["F"]) for r in rs}:
-                sel = [r for r in rs if (r["R"], r["K"], r["F"]) == key]
-                vmax = max(int(r["V_max"]) for r in sel)
-                worst = min(f(r["ratio_lower"]) for r in sel)
-                und = max(f(r["undetermined_share"]) for r in sel)
-                if worst >= 0.98 and (best_ is None or vmax < best_[0]):
-                    best_ = (vmax, key, worst, und)
-            if best_:
-                w(f"| {model[-2:]} | {B} | {'/'.join(best_[1])} | {best_[0]} | {best_[2]:.3f} | {pc(best_[3], 2)} |")
-            else:
-                w(f"| {model[-2:]} | {B} | 無設定達到 0.98 | – | – | – |")
+            b_ = frow(model, B)
+            fr[(model, B)] = b_
+            if b_:
+                w(f"| {model[-2:]} | {B} | {'/'.join(b_[3])} | {b_[2]} | {b_[0]:.3f}–{b_[1]:.3f} | {pc(b_[4], 2)} |")
     w("")
-    w("這代表：批次內容只用到詞彙表的一小部分，exit head 限制在聯集詞彙上幾乎不損失接受率。")
+    w("這代表：批次內容只用到詞彙表的一小部分（8B、B = 32 最多 "
+      + (str(fr[("layerskip-llama3-8B", 32)][2]) if fr.get(("layerskip-llama3-8B", 32)) else "–")
+      + " 個 token），exit head 限制在聯集詞彙上的接受率損失最多 "
+      + pc(1 - min(v[0] for v in fr.values() if v), 1) + "（下界）；上界 ≥ 1 表示也可能完全不損失，差距來自 top-64 無法判定的位置（最多 "
+      + pc(max(v[4] for v in fr.values() if v), 1) + "）。")
     w("")
 
     w("## 4. 重現與注意事項")

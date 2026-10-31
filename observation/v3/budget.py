@@ -195,7 +195,7 @@ def cmd_tails(args) -> None:
 COMP = ["sh_layers", "sh_attn_kv", "sh_head", "dp_layers", "dp_attn_kv", "dp_head", "accept_readback",
         "metadata_upload", "host_other", "prefill"]
 COMP_ZH = {"sh_layers": "淺層 k 層（不含 KV 讀取）", "sh_attn_kv": "淺層 attention/KV 讀取", "sh_head": "淺層 LM head",
-           "dp_layers": "深層 L−k 層（AR：全部 L 層；不含 KV 讀取）", "dp_attn_kv": "深層 attention/KV 讀取",
+           "dp_layers": "深層 L-k 層（AR：全部 L 層；不含 KV 讀取）", "dp_attn_kv": "深層 attention/KV 讀取",
            "dp_head": "深層 LM head（AR：LM head）",
            "accept_readback": "接受判斷與讀回", "metadata_upload": "metadata 與上傳", "host_other": "host 開銷（其他）",
            "prefill": "prefill"}

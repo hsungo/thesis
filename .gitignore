@@ -20,3 +20,6 @@ observation/*
 !observation/v3/
 CLAUDE.md
 github/
+
+# observation v3 raw run JSONs (summarised in results/observe-4060/*.csv)
+results/observe-4060/cheats/
