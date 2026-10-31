@@ -19,6 +19,7 @@ from __future__ import annotations
 
 import argparse
 import dataclasses
+import gc
 import json
 import sys
 import time
@@ -224,6 +225,7 @@ def cmd_run(args) -> None:
         f.write_text(json.dumps(res, default=str))
         model.free_cache()
         del eng
+        gc.collect()                          # the prefix-cache closure keeps a reference cycle with the engine
         torch.cuda.empty_cache()
         m = res["metrics"]
         print(f"[cheats] {n + 1}/{len(plan)} {ds[:5]} B={B:2d} {ch:7s} {cname:9s} rep{rep}: {m['wall_throughput_tok_s']:7.1f} tok/s "
