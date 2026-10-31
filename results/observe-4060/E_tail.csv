@@ -1,0 +1,5 @@
+model,task,source,rounds,tail_rounds_share,tail_alignment_mean,extra_per_round,ngram_extra_per_round_G8_log
+layerskip-llama3-1B,cnn_dm_summarization,rejected_tail,2963,0.434695,0.125,0.00607492,3.51299
+layerskip-llama3-1B,gsm8k,rejected_tail,935,0.761497,0.238764,0.0513369,0.728342
+layerskip-llama3-1B,human_eval,rejected_tail,1044,0.596743,0.306581,0.01341,0.950192
+layerskip-llama3-1B,xsum_summarization,rejected_tail,563,0.786856,0.0767494,0.0124334,0.642984
